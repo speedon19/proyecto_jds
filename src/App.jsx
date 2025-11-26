@@ -134,6 +134,224 @@ const formatFechaCR = (fecha) => {
   }
 }
 
+// Función helper para verificar si un rol es de supervisor
+const esRolSupervisor = (rol) => {
+  if (!rol) return false
+  return rol.Name === 'Supervisor de Personal' || rol.NormalizedName === 'SUPERVISOR DE PERSONAL'
+}
+
+// Función helper centralizada para obtener horario laboral de un empleado
+const obtenerHorarioLaboralEmpleado = async (empleadoId) => {
+  if (!empleadoId) return null
+  
+  try {
+    const { data: empleadoData, error } = await supabase
+      .from('Empleados')
+      .select('HorarioLaboral')
+      .eq('Id', empleadoId)
+      .single()
+    
+    if (error) {
+      console.error(`Error al obtener horario laboral para empleado ${empleadoId}:`, error)
+      return null
+    }
+    
+    if (!empleadoData?.HorarioLaboral) return null
+    
+    // Parsear si viene como string JSON
+    if (typeof empleadoData.HorarioLaboral === 'string') {
+      try {
+        return JSON.parse(empleadoData.HorarioLaboral)
+      } catch (e) {
+        console.error('Error al parsear horario laboral:', e)
+        return null
+      }
+    }
+    
+    return empleadoData.HorarioLaboral
+  } catch (err) {
+    console.error('Error al obtener horario laboral:', err)
+    return null
+  }
+}
+
+// Función helper centralizada para calcular tardía basándose en horario laboral
+const calcularTardiaEmpleado = (horarioLaboral, fecha, horaEntrada) => {
+  if (!horarioLaboral || !fecha || !horaEntrada) return 0
+  
+  try {
+    // Verificar si es día laboral
+    const esDiaLaboralFecha = esDiaLaboral(horarioLaboral, fecha)
+    if (!esDiaLaboralFecha) {
+      return 0 // No es día laboral, no hay tardía
+    }
+    
+    // Obtener hora esperada según el horario
+    const horaEsperadaData = obtenerHoraEntradaEsperada(horarioLaboral, fecha)
+    if (!horaEsperadaData) {
+      return 0 // No hay hora esperada para ese día
+    }
+    
+    // Convertir hora de entrada a zona horaria de Costa Rica
+    const horaEntradaReal = new Date(horaEntrada)
+    const horaRealStr = horaEntradaReal.toLocaleString('en-US', { 
+      timeZone: 'Etc/GMT+6',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false
+    })
+    
+    const [horaReal, minutoReal] = horaRealStr.split(':').map(Number)
+    
+    // Calcular diferencia en minutos desde medianoche
+    const minutosReal = horaReal * 60 + minutoReal
+    const minutosEsperados = horaEsperadaData.hora * 60 + horaEsperadaData.minuto
+    
+    // Calcular tardía básica (solo si llegó después de la hora esperada)
+    const diferencia = minutosReal - minutosEsperados
+    const minutosTardia = diferencia > 0 ? diferencia : 0
+    
+    return minutosTardia
+  } catch (err) {
+    console.error('Error al calcular tardía:', err)
+    return 0
+  }
+}
+
+// Función helper centralizada para determinar estado de asistencia basándose en horario
+const determinarEstadoAsistencia = (horarioLaboral, fecha, asistencia, tienePermiso) => {
+  if (!horarioLaboral) {
+    return {
+      esDiaLaboral: false,
+      esPresente: false,
+      esAusente: false,
+      minutosTardia: 0
+    }
+  }
+  
+  const esDiaLaboralFecha = esDiaLaboral(horarioLaboral, fecha)
+  
+  if (!esDiaLaboralFecha) {
+    return {
+      esDiaLaboral: false,
+      esPresente: false,
+      esAusente: false,
+      minutosTardia: 0
+    }
+  }
+  
+  // Si tiene permiso, no cuenta como presente ni ausente
+  if (tienePermiso) {
+    return {
+      esDiaLaboral: true,
+      esPresente: false,
+      esAusente: false,
+      minutosTardia: 0
+    }
+  }
+  
+  // Calcular tardía si tiene hora de entrada
+  let minutosTardia = 0
+  if (asistencia?.HoraEntrada) {
+    minutosTardia = calcularTardiaEmpleado(horarioLaboral, fecha, asistencia.HoraEntrada)
+  }
+  
+  // Determinar si es presente o ausente
+  // Un empleado está presente si:
+  // 1. Tiene asistencia registrada
+  // 2. Tiene hora de entrada (HoraEntrada no es null/undefined)
+  // 3. El estado es 'Presente' O simplemente tiene HoraEntrada (ya que si tiene hora de entrada, está presente)
+  const tieneHoraEntrada = asistencia?.HoraEntrada !== null && asistencia?.HoraEntrada !== undefined
+  const estadoEsPresente = asistencia?.Estado === 'Presente'
+  
+  // Si tiene hora de entrada, está presente (independientemente del estado)
+  // El estado puede no estar actualizado, pero si tiene HoraEntrada, significa que asistió
+  const esPresente = tieneHoraEntrada && (estadoEsPresente || asistencia) // Si tiene HoraEntrada, está presente
+  
+  // Está ausente si:
+  // 1. Es día laboral Y
+  // 2. (No tiene asistencia O tiene asistencia con estado 'Ausente' O no tiene HoraEntrada cuando debería tenerla)
+  const esAusente = esDiaLaboralFecha && (
+    !asistencia || // No hay registro de asistencia
+    (asistencia && asistencia.Estado === 'Ausente' && !tieneHoraEntrada) || // Tiene registro pero está marcado como ausente sin hora
+    (asistencia && !tieneHoraEntrada && !estadoEsPresente) // Tiene registro pero no tiene hora de entrada y no está marcado como presente
+  )
+  
+  return {
+    esDiaLaboral: true,
+    esPresente,
+    esAusente,
+    minutosTardia
+  }
+}
+
+// Función helper para calcular tiempo restante de pausa desde la base de datos
+// Esta función calcula el tiempo basándose en HoraInicio, TiempoPausadoAcumulado y si está pausada
+const calcularTiempoRestantePausa = (pausa) => {
+  if (!pausa || !pausa.Activa) {
+    return null
+  }
+  
+  // Si está pausada, retornar el tiempo guardado
+  if (pausa.Pausada === true) {
+    return pausa.TiempoRestanteSegundos || 3600
+  }
+  
+  // Si no está pausada, calcular desde HoraInicio
+  const ahora = getCostaRicaTime()
+  const inicio = toCostaRicaDate(pausa.HoraInicio) || new Date(pausa.HoraInicio)
+  const transcurrido = Math.floor((ahora - inicio) / 1000) // segundos transcurridos
+  const tiempoPausado = pausa.TiempoPausadoAcumulado || 0
+  const tiempoActivo = transcurrido - tiempoPausado // tiempo que ha estado activa
+  const tiempoRestante = Math.max(0, 3600 - tiempoActivo) // 60 minutos = 3600 segundos
+  
+  return tiempoRestante
+}
+
+// Función helper para obtener tiempo restante del día anterior (si existe)
+const obtenerTiempoRestanteDiaAnterior = async (empleadoId) => {
+  try {
+    const hoy = getCostaRicaDateString()
+    const hoyDate = new Date(hoy)
+    const ayerDate = new Date(hoyDate)
+    ayerDate.setDate(ayerDate.getDate() - 1)
+    const ayer = ayerDate.toISOString().split('T')[0]
+    
+    // Buscar asistencia de ayer
+    const { data: asistenciaAyer } = await supabase
+      .from('Asistencias')
+      .select('Id')
+      .eq('EmpleadoId', empleadoId)
+      .eq('Fecha', ayer)
+      .maybeSingle()
+    
+    if (!asistenciaAyer) {
+      return null
+    }
+    
+    // Buscar pausa activa de ayer
+    const { data: pausaAyer } = await supabase
+      .from('Pausas')
+      .select('TiempoRestanteSegundos, TiempoPausadoAcumulado, HoraInicio, Pausada')
+      .eq('AsistenciaId', asistenciaAyer.Id)
+      .eq('Activa', true)
+      .eq('TipoPausa', 'Mi tiempo')
+      .order('HoraInicio', { ascending: false })
+      .limit(1)
+      .maybeSingle()
+    
+    if (!pausaAyer) {
+      return null
+    }
+    
+    // Calcular tiempo restante de ayer
+    return calcularTiempoRestantePausa(pausaAyer)
+  } catch (err) {
+    console.error('Error al obtener tiempo del día anterior:', err)
+    return null
+  }
+}
+
 // Función helper para formatear hora en zona horaria de Costa Rica (GMT-6)
 const formatHoraCR = (fecha) => {
   if (!fecha) return ''
@@ -311,12 +529,11 @@ const crearNotificacionTardia = async (empleadoId, fecha) => {
 
     // Si ya existe una notificación para hoy, no crear otra
     if (notificacionesExistentes && notificacionesExistentes.length > 0) {
-      console.log('Ya existe notificación de tardía para este empleado hoy')
       return
     }
 
     // Crear el anuncio destacado
-    const { data: anuncio, error: anuncioError } = await supabase
+    const { error: anuncioError } = await supabase
       .from('Anuncios')
       .insert({
         Titulo: 'Registro de Tardía',
@@ -326,34 +543,78 @@ const crearNotificacionTardia = async (empleadoId, fecha) => {
         Destacado: true,
         Autor: 'Sistema',
       })
-      .select()
-      .single()
 
     if (anuncioError) {
       console.error('Error al crear notificación de tardía:', anuncioError)
-    } else {
-      console.log('✅ Notificación de tardía creada exitosamente:', anuncio)
     }
   } catch (err) {
     console.error('Error al crear notificación de tardía:', err)
   }
 }
 
+// Función helper para obtener el día de la semana en zona horaria de Costa Rica
+const obtenerDiaSemanaCR = (fecha) => {
+  try {
+    // Si la fecha viene como string "YYYY-MM-DD", crear Date correctamente
+    let fechaObj
+    if (typeof fecha === 'string' && fecha.match(/^\d{4}-\d{2}-\d{2}$/)) {
+      // Crear fecha interpretando como medianoche en zona horaria local
+      // Luego usar Intl para obtener el día en zona horaria de Costa Rica
+      const [year, month, day] = fecha.split('-').map(Number)
+      fechaObj = new Date(year, month - 1, day)
+    } else {
+      fechaObj = new Date(fecha)
+    }
+    
+    // Obtener el día de la semana en zona horaria de Costa Rica usando Intl
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'Etc/GMT+6',
+      weekday: 'long'
+    })
+    const diaNombreIngles = formatter.format(fechaObj)
+    
+    // Mapear nombre en inglés a número de día (0=Domingo, 1=Lunes, etc.)
+    const diasInglesMap = {
+      'Sunday': 0,
+      'Monday': 1,
+      'Tuesday': 2,
+      'Wednesday': 3,
+      'Thursday': 4,
+      'Friday': 5,
+      'Saturday': 6
+    }
+    
+    return diasInglesMap[diaNombreIngles] ?? null
+  } catch (err) {
+    console.error('Error al obtener día de la semana:', err)
+    return null
+  }
+}
+
 // Función para verificar si un día es laboral según el horario del empleado
 const esDiaLaboral = (horarioLaboral, fecha) => {
-  if (!horarioLaboral) return false
+  if (!horarioLaboral) {
+    console.log('⚠️ esDiaLaboral: No hay horario laboral')
+    return false
+  }
   
   try {
     const horario = typeof horarioLaboral === 'string' 
       ? JSON.parse(horarioLaboral) 
       : horarioLaboral
     
-    if (!horario || typeof horario !== 'object') return false
+    if (!horario || typeof horario !== 'object') {
+      console.log('⚠️ esDiaLaboral: Horario no es un objeto válido')
+      return false
+    }
     
-    // Obtener fecha en zona horaria de Costa Rica
-    const fechaObj = new Date(fecha)
-    const fechaCR = new Date(fechaObj.toLocaleString('en-US', { timeZone: 'Etc/GMT+6' }))
-    const diaSemana = fechaCR.getDay()
+    // Obtener día de la semana en zona horaria de Costa Rica
+    const diaSemana = obtenerDiaSemanaCR(fecha)
+    
+    if (diaSemana === null) {
+      console.log('⚠️ esDiaLaboral: No se pudo determinar el día de la semana')
+      return false
+    }
     
     // Mapear día de la semana (0=Domingo, 1=Lunes, etc.) a nombre en minúscula
     const diasSemanaMap = {
@@ -367,20 +628,38 @@ const esDiaLaboral = (horarioLaboral, fecha) => {
     }
     const diaNombre = diasSemanaMap[diaSemana]
     
-    if (!diaNombre) return false
+    console.log('📅 esDiaLaboral - Detalles:', {
+      fecha,
+      diaSemana,
+      diaNombre,
+      horarioCompleto: horario,
+      diasDisponibles: Object.keys(horario)
+    })
+    
+    if (!diaNombre) {
+      console.log('⚠️ esDiaLaboral: No se pudo determinar el nombre del día')
+      return false
+    }
     
     // El horario tiene estructura: { "lunes": { "08:00": "full", "09:00": "full", ... }, ... }
     const horarioDia = horario[diaNombre]
-    if (!horarioDia || typeof horarioDia !== 'object') return false
+    console.log(`📋 Horario para ${diaNombre}:`, horarioDia)
+    
+    if (!horarioDia || typeof horarioDia !== 'object') {
+      console.log(`⚠️ No hay horario configurado para ${diaNombre}`)
+      return false
+    }
     
     // Verificar si hay al menos una hora laboral (full o half) en este día
     const tieneHorasLaborales = Object.values(horarioDia).some(estado => 
       estado === 'full' || estado === 'half'
     )
     
+    console.log(`✅ ${diaNombre} tiene horas laborales:`, tieneHorasLaborales, 'Horas:', Object.keys(horarioDia).length)
+    
     return tieneHorasLaborales
   } catch (err) {
-    console.error('Error al verificar si es día laboral:', err)
+    console.error('❌ Error al verificar si es día laboral:', err)
     return false
   }
 }
@@ -395,10 +674,10 @@ const obtenerHoraEntradaEsperada = (horarioLaboral, fecha) => {
     
     if (!horario || typeof horario !== 'object') return null
     
-    // Obtener fecha en zona horaria de Costa Rica
-    const fechaObj = new Date(fecha)
-    const fechaCR = new Date(fechaObj.toLocaleString('en-US', { timeZone: 'Etc/GMT+6' }))
-    const diaSemana = fechaCR.getDay()
+    // Obtener día de la semana en zona horaria de Costa Rica
+    const diaSemana = obtenerDiaSemanaCR(fecha)
+    
+    if (diaSemana === null) return null
     
     // Mapear día de la semana (0=Domingo, 1=Lunes, etc.) a nombre en minúscula
     // El horario se guarda con días en minúscula: "lunes", "martes", etc.
@@ -434,6 +713,15 @@ const obtenerHoraEntradaEsperada = (horarioLaboral, fecha) => {
     const primeraHoraStr = horas[0]
     const [hora, minuto] = primeraHoraStr.split(':').map(Number)
     
+    // Crear fecha en zona horaria de Costa Rica para el cálculo
+    let fechaCR
+    if (typeof fecha === 'string' && fecha.match(/^\d{4}-\d{2}-\d{2}$/)) {
+      const [year, month, day] = fecha.split('-').map(Number)
+      fechaCR = new Date(year, month - 1, day)
+    } else {
+      fechaCR = new Date(fecha)
+    }
+    
     // Retornar objeto con hora y minuto, y también la fecha para crear el Date
     return {
       hora,
@@ -461,13 +749,11 @@ function App() {
 
   // Función para registrar asistencia al iniciar sesión
   const registrarAsistenciaInicioSesion = async (userEmail) => {
-    console.log('=== INICIANDO REGISTRO DE ASISTENCIA ===')
-    console.log('Email del usuario:', userEmail)
-    
+    console.log('🎯 INICIANDO REGISTRO DE ASISTENCIA AL LOGIN')
     try {
       // Buscar usuario por email (case-insensitive)
-      // Normalizar el email a mayúsculas para la búsqueda
       const emailNormalizado = userEmail.toUpperCase()
+      console.log('🔍 Buscando usuario:', emailNormalizado)
       const { data: usuario, error: errorUsuario } = await supabase
         .from('Usuarios')
         .select('EmpleadoId')
@@ -479,18 +765,16 @@ function App() {
         return
       }
 
-      console.log('Usuario encontrado:', usuario)
-
       if (!usuario?.EmpleadoId) {
-        console.warn('⚠️ Usuario no tiene EmpleadoId asociado')
+        console.log('⚠️ Usuario sin EmpleadoId')
         return
       }
 
-      console.log('EmpleadoId:', usuario.EmpleadoId)
+      console.log('✅ Usuario encontrado, EmpleadoId:', usuario.EmpleadoId)
 
       // Obtener fecha actual en zona horaria de Costa Rica
       const hoy = getCostaRicaDateString()
-      console.log('Fecha de hoy (Costa Rica):', hoy)
+      console.log('📅 Fecha hoy:', hoy)
 
       // Verificar si tiene permiso aprobado para hoy
       const { data: permisos, error: errorPermisos } = await supabase
@@ -506,11 +790,11 @@ function App() {
       }
 
       if (permisos && permisos.length > 0) {
-        console.log('⚠️ Usuario tiene permiso aprobado para hoy, no se registra asistencia')
         return
       }
 
       // Buscar asistencia de hoy
+      console.log('🔍 Buscando asistencia existente...')
       const { data: asistenciaExistente, error: errorAsistencia } = await supabase
         .from('Asistencias')
         .select('Id, HoraEntrada, Estado')
@@ -518,92 +802,47 @@ function App() {
         .eq('Fecha', hoy)
         .maybeSingle()
 
+      console.log('📋 Asistencia existente:', asistenciaExistente)
+
       if (errorAsistencia) {
         console.error('❌ Error al buscar asistencia:', errorAsistencia)
+        return
       }
-
-      console.log('Asistencia existente:', asistenciaExistente)
 
       // Si ya existe asistencia con hora de entrada, no hacer nada
       if (asistenciaExistente?.HoraEntrada) {
-        console.log('✅ Ya existe asistencia con hora de entrada para hoy')
+        console.log('✅ Ya existe asistencia con HoraEntrada, no se registra de nuevo')
         return
       }
 
-      // Obtener horario del empleado para calcular tardía
-      const { data: empleado, error: errorEmpleado } = await supabase
-        .from('Empleados')
-        .select('HorarioLaboral')
-        .eq('Id', usuario.EmpleadoId)
-        .single()
+      // Obtener horario laboral del empleado usando función helper
+      const horarioLaboral = await obtenerHorarioLaboralEmpleado(usuario.EmpleadoId)
 
-      if (errorEmpleado) {
-        console.error('❌ Error al obtener empleado:', errorEmpleado)
+      if (!horarioLaboral) {
+        console.log('⚠️ No tiene horario laboral')
+        return
       }
-
-      console.log('Empleado encontrado:', empleado ? 'Sí' : 'No')
-      console.log('Tiene horario laboral:', empleado?.HorarioLaboral ? 'Sí' : 'No')
 
       // VERIFICAR SI ES DÍA LABORAL SEGÚN EL HORARIO
-      if (!empleado?.HorarioLaboral) {
-        console.log('⚠️ Empleado no tiene horario laboral configurado, no se registra asistencia')
-        return
-      }
-
-      const esDiaLaboralHoy = esDiaLaboral(empleado.HorarioLaboral, hoy)
-      console.log('¿Es día laboral según horario?:', esDiaLaboralHoy)
+      const esDiaLaboralHoy = esDiaLaboral(horarioLaboral, hoy)
+      console.log('📆 ¿Es día laboral?', esDiaLaboralHoy)
 
       if (!esDiaLaboralHoy) {
-        console.log('⚠️ Hoy NO es día laboral según el horario del empleado, no se registra asistencia')
+        console.log('🏠 No es día laboral, no se registra asistencia')
         return
       }
 
       const horaEntradaReal = getCostaRicaTime()
-      let minutosTardia = 0
+      console.log('🕐 Hora de entrada:', horaEntradaReal.toISOString())
 
-      console.log('Hora de entrada real:', horaEntradaReal.toISOString())
-
-      // Calcular tardía basándose en el horario laboral (ya verificamos que es día laboral)
-      const horaEsperadaData = obtenerHoraEntradaEsperada(empleado.HorarioLaboral, hoy)
-      console.log('Hora esperada data:', horaEsperadaData)
-      
-      if (horaEsperadaData) {
-        // Obtener componentes de hora de la entrada real (en zona horaria de Costa Rica)
-        // horaEntradaReal ya está en hora de Costa Rica gracias a getCostaRicaTime()
-        // Usar toLocaleString para obtener la hora en zona horaria de Costa Rica
-        const horaRealStr = horaEntradaReal.toLocaleString('en-US', { 
-          timeZone: 'Etc/GMT+6',
-          hour: '2-digit',
-          minute: '2-digit',
-          hour12: false
-        })
-        const [horaReal, minutoReal] = horaRealStr.split(':').map(Number)
-        
-        console.log(`Hora real (Costa Rica): ${horaReal}:${minutoReal}`)
-        console.log(`Hora esperada: ${horaEsperadaData.hora}:${horaEsperadaData.minuto}`)
-        
-        // Calcular diferencia en minutos directamente
-        const minutosReal = horaReal * 60 + minutoReal
-        const minutosEsperados = horaEsperadaData.hora * 60 + horaEsperadaData.minuto
-        
-        // Calcular tardía básica (solo si llegó después de la hora esperada)
-        const diferencia = minutosReal - minutosEsperados
-        const minutosTardiaBasica = diferencia > 0 ? diferencia : 0
-        
-        // Aplicar reglas especiales de cálculo de tardía
-        const tardiaCalculada = calcularTardiaConReglas(minutosTardiaBasica)
-        minutosTardia = minutosTardiaBasica // Guardamos los minutos reales para la BD
-        
-        console.log(`Minutos reales: ${minutosReal}, Minutos esperados: ${minutosEsperados}, Diferencia: ${diferencia}`)
-        console.log(`Tardía calculada: ${tardiaCalculada.descripcion} (${minutosTardiaBasica} minutos reales)`)
-      } else {
-        console.log('⚠️ No se pudo obtener hora esperada, pero es día laboral, se registra sin tardía')
-      }
+      // Calcular tardía usando función helper centralizada
+      const minutosTardia = calcularTardiaEmpleado(horarioLaboral, hoy, horaEntradaReal.toISOString())
+      console.log('⏱️ Minutos de tardía:', minutosTardia)
 
       // Si ya existe asistencia sin hora de entrada, actualizarla
       if (asistenciaExistente) {
-        console.log('📝 Actualizando asistencia existente (ID:', asistenciaExistente.Id, ')')
-        const { data: updatedData, error: updateError } = await supabase
+        console.log('📝 Actualizando asistencia existente ID:', asistenciaExistente.Id)
+        const { data: updated, error: updateError } = await supabase
           .from('Asistencias')
           .update({
             HoraEntrada: horaEntradaReal.toISOString(),
@@ -616,13 +855,7 @@ function App() {
         if (updateError) {
           console.error('❌ Error al actualizar asistencia:', updateError)
         } else {
-          console.log('✅ Asistencia actualizada correctamente:', {
-            Id: asistenciaExistente.Id,
-            HoraEntrada: horaEntradaReal.toISOString(),
-            MinutosTardia: minutosTardia,
-            updatedData
-          })
-          
+          console.log('✅ Asistencia actualizada correctamente:', updated)
           // Si hay tardía, crear notificación automática
           if (minutosTardia > 0) {
             await crearNotificacionTardia(usuario.EmpleadoId, hoy)
@@ -630,8 +863,8 @@ function App() {
         }
       } else {
         // Crear nueva asistencia
-        console.log('➕ Creando nueva asistencia')
-        const { data: newAsistencia, error: insertError } = await supabase
+        console.log('➕ Creando nueva asistencia...')
+        const { data: created, error: insertError } = await supabase
           .from('Asistencias')
           .insert({
             EmpleadoId: usuario.EmpleadoId,
@@ -644,28 +877,17 @@ function App() {
 
         if (insertError) {
           console.error('❌ Error al crear asistencia:', insertError)
-          console.error('Detalles del error:', JSON.stringify(insertError, null, 2))
         } else {
-          console.log('✅ Asistencia creada correctamente:', {
-            Id: newAsistencia?.[0]?.Id,
-            EmpleadoId: usuario.EmpleadoId,
-            Fecha: hoy,
-            HoraEntrada: horaEntradaReal.toISOString(),
-            MinutosTardia: minutosTardia,
-            newAsistencia
-          })
-          
+          console.log('✅ Asistencia creada correctamente:', created)
           // Si hay tardía, crear notificación automática
           if (minutosTardia > 0) {
             await crearNotificacionTardia(usuario.EmpleadoId, hoy)
           }
         }
       }
-      
-      console.log('=== FIN REGISTRO DE ASISTENCIA ===')
+      console.log('🏁 REGISTRO DE ASISTENCIA COMPLETADO')
     } catch (err) {
       console.error('❌ Error general al registrar asistencia:', err)
-      console.error('Stack trace:', err.stack)
     }
   }
 
@@ -687,12 +909,12 @@ function App() {
         user: data.user,
         session: data.session,
       })
-      setMessage('Inicio de sesión exitoso')
-
-      // Registrar asistencia automáticamente al iniciar sesión
+      // Registrar asistencia automáticamente al iniciar sesión ANTES de mostrar dashboard
       await registrarAsistenciaInicioSesion(data.user.email).catch(err => {
         console.error('Error al registrar asistencia en handleSubmit:', err)
       })
+
+      setMessage('Inicio de sesión exitoso')
     } catch (err) {
       setSessionInfo(null)
       setError(err.message ?? 'Ocurrió un error inesperado')
@@ -986,6 +1208,46 @@ const DashboardView = ({ sessionInfo, onSignOut, loading }) => {
   )
 }
 
+// Función helper para calcular métricas del panel de supervisión
+const calcularMetricasSupervision = (empleadosConEstado, totalEmpleados) => {
+  const empleadosActivos = empleadosConEstado.filter((e) => e.status === 'Activo').length
+  const empleadosEnPausa = empleadosConEstado.filter((e) => e.status === 'En Pausa').length
+  const empleadosAusentes = empleadosConEstado.filter((e) => 
+    e.status === 'Ausente' && e.color === 'danger'
+  ).length
+
+  return [
+    {
+      label: 'Empleados supervisados',
+      value: totalEmpleados.toString(),
+      hint: `Capacidad total ${totalEmpleados}`,
+      tone: 'primary',
+      progress: totalEmpleados > 0 ? Math.min((totalEmpleados / Math.max(totalEmpleados, 4)) * 100, 100) : 0,
+    },
+    {
+      label: 'Activos ahora',
+      value: empleadosActivos.toString(),
+      hint: 'Actualizado hace unos segundos',
+      tone: 'success',
+      progress: totalEmpleados > 0 ? (empleadosActivos / totalEmpleados) * 100 : 0,
+    },
+    {
+      label: 'En pausa',
+      value: empleadosEnPausa.toString(),
+      hint: empleadosEnPausa > 0 ? `${empleadosEnPausa} empleado${empleadosEnPausa > 1 ? 's' : ''} en receso` : 'Sin recesos vigentes',
+      tone: 'warning',
+      progress: totalEmpleados > 0 ? (empleadosEnPausa / totalEmpleados) * 100 : 0,
+    },
+    {
+      label: 'Ausentes',
+      value: empleadosAusentes.toString(),
+      hint: empleadosAusentes > 0 ? `${empleadosAusentes} empleado${empleadosAusentes > 1 ? 's' : ''} sin asistencia` : 'Todo el equipo presente',
+      tone: 'danger',
+      progress: totalEmpleados > 0 ? (empleadosAusentes / totalEmpleados) * 100 : 0,
+    },
+  ]
+}
+
 const SupervisionPanel = ({ sessionInfo }) => {
   const [metrics, setMetrics] = useState([
     {
@@ -1054,9 +1316,7 @@ const SupervisionPanel = ({ sessionInfo }) => {
             .eq('UserId', usuario.Id)
 
           const roles = rolesUsuario?.map(ur => ur.Roles).filter(Boolean) || []
-          const tieneSupervisor = roles.some(
-            r => r?.Name === 'Supervisor de Personal' || r?.NormalizedName === 'SUPERVISOR DE PERSONAL'
-          )
+          const tieneSupervisor = roles.some(esRolSupervisor)
           setIsSupervisor(tieneSupervisor)
 
           // Si es supervisor, obtener su proyecto supervisado
@@ -1364,18 +1624,25 @@ const SupervisionPanel = ({ sessionInfo }) => {
     setSelectedEmpleado(agent)
     setShowHistorialModal(true)
     setError('')
+    setHistorialData(null) // Limpiar datos anteriores mientras carga
     
     try {
       const hoy = getCostaRicaDateString()
       
-      // Cargar asistencia del día
-      const { data: asistenciaData } = await supabase
+      // Cargar asistencia del día con todos los campos necesarios
+      const { data: asistenciaData, error: asistenciaError } = await supabase
         .from('Asistencias')
         .select('*')
         .eq('EmpleadoId', agent.id)
         .eq('Fecha', hoy)
         .maybeSingle()
 
+      if (asistenciaError) {
+        console.error('Error al cargar asistencia:', asistenciaError)
+        setError('Error al cargar la asistencia')
+      }
+
+      // Si no hay asistencia, mostrar mensaje pero no error
       if (!asistenciaData) {
         setHistorialData({
           asistencia: null,
@@ -1385,21 +1652,50 @@ const SupervisionPanel = ({ sessionInfo }) => {
         return
       }
 
+      // Recalcular tardía basándose en el horario actual del empleado
+      const horarioLaboral = await obtenerHorarioLaboralEmpleado(agent.id)
+      let minutosTardia = asistenciaData.MinutosTardia || 0
+      
+      if (horarioLaboral && asistenciaData.HoraEntrada) {
+        minutosTardia = calcularTardiaEmpleado(
+          horarioLaboral,
+          hoy,
+          asistenciaData.HoraEntrada
+        )
+        
+        // Actualizar en BD si cambió
+        if (minutosTardia !== asistenciaData.MinutosTardia) {
+          await supabase
+            .from('Asistencias')
+            .update({ MinutosTardia: minutosTardia })
+            .eq('Id', asistenciaData.Id)
+        }
+      }
+
       // Cargar pausas del día
-      const { data: pausasData } = await supabase
+      const { data: pausasData, error: pausasError } = await supabase
         .from('Pausas')
         .select('*')
         .eq('AsistenciaId', asistenciaData.Id)
         .order('HoraInicio', { ascending: true })
 
+      if (pausasError) {
+        console.error('Error al cargar pausas:', pausasError)
+      }
+
       setHistorialData({
         asistencia: asistenciaData,
         pausas: pausasData || [],
-        minutosTardia: asistenciaData.MinutosTardia || 0
+        minutosTardia: minutosTardia
       })
     } catch (err) {
       console.error('Error al cargar historial:', err)
       setError('Error al cargar el historial')
+      setHistorialData({
+        asistencia: null,
+        pausas: [],
+        minutosTardia: 0
+      })
     }
   }
 
@@ -1440,7 +1736,7 @@ const SupervisionPanel = ({ sessionInfo }) => {
       setSelectedEmpleado(null)
       setTipoPausa('')
       
-      // Recargar datos
+      // Recargar datos completos (incluyendo métricas)
       const cargarDatos = async () => {
         const hoy = getCostaRicaDateString()
         
@@ -1460,21 +1756,89 @@ const SupervisionPanel = ({ sessionInfo }) => {
         if (empleadosData) {
           const { data: asistenciasData } = await supabase
             .from('Asistencias')
-            .select('EmpleadoId, Estado, Id')
+            .select('EmpleadoId, Estado, Id, HoraEntrada')
             .eq('Fecha', hoy)
 
-          const empleadosConEstado = empleadosData.map((emp) => {
+          // Cargar permisos aprobados para hoy
+          const { data: permisosData } = await supabase
+            .from('Permisos')
+            .select('EmpleadoId, Tipo')
+            .eq('Estado', 'Aprobado')
+            .lte('FechaInicio', hoy)
+            .gte('FechaFin', hoy)
+
+          const empleadosConPermiso = new Set(permisosData?.map(p => p.EmpleadoId) || [])
+
+          // Cargar horarios laborales
+          const { data: empleadosConHorario } = await supabase
+            .from('Empleados')
+            .select('Id, HorarioLaboral')
+            .in('Id', empleadosData.map(e => e.Id))
+
+          // Cargar pausas activas
+          const { data: pausasData } = await supabase
+            .from('Pausas')
+            .select('*')
+            .eq('Activa', true)
+
+          const empleadosConEstado = await Promise.all(empleadosData.map(async (emp) => {
             const asistencia = asistenciasData?.find((a) => a.EmpleadoId === emp.Id)
+            const tienePermiso = empleadosConPermiso.has(emp.Id)
+            
+            // Obtener horario laboral del empleado usando función helper
+            const horarioLaboral = await obtenerHorarioLaboralEmpleado(emp.Id)
+            
+            // Determinar estado de asistencia usando función helper centralizada
+            const estadoAsistencia = determinarEstadoAsistencia(
+              horarioLaboral,
+              hoy,
+              asistencia,
+              tienePermiso
+            )
+            
+            const pausaActiva = pausasData?.find((p) => p.AsistenciaId === asistencia?.Id)
+            
+            if (tienePermiso) {
+              const permiso = permisosData?.find(p => p.EmpleadoId === emp.Id)
+              const esVacaciones = permiso?.Tipo === 'Vacaciones'
+              return {
+                id: emp.Id,
+                name: emp.NombreCompleto,
+                status: esVacaciones ? 'En Vacaciones' : 'En Permiso',
+                color: 'warning',
+                asistenciaId: asistencia?.Id || null,
+                tienePausaActiva: !!pausaActiva
+              }
+            }
+            
+            // Usar estados determinados por la función helper
+            const esActivo = estadoAsistencia.esPresente
+            
+            if (pausaActiva && esActivo) {
+              return {
+                id: emp.Id,
+                name: emp.NombreCompleto,
+                status: 'En Pausa',
+                color: 'warning',
+                asistenciaId: asistencia?.Id || null,
+                tienePausaActiva: true
+              }
+            }
+            
             return {
               id: emp.Id,
               name: emp.NombreCompleto,
-              status: asistencia?.Estado === 'Presente' ? 'Activo' : 'Ausente',
-              color: asistencia?.Estado === 'Presente' ? 'success' : 'danger',
+              status: esActivo ? 'Activo' : (estadoAsistencia.esAusente ? 'Ausente' : 'No laboral'),
+              color: esActivo ? 'success' : (estadoAsistencia.esAusente ? 'danger' : 'secondary'),
               asistenciaId: asistencia?.Id || null,
+              tienePausaActiva: !!pausaActiva
             }
-          })
+          }))
 
+          // Calcular métricas
+          const totalEmpleados = empleadosData.length
           setLiveAgents(empleadosConEstado)
+          setMetrics(calcularMetricasSupervision(empleadosConEstado, totalEmpleados))
         }
       }
       cargarDatos()
@@ -1502,16 +1866,6 @@ const SupervisionPanel = ({ sessionInfo }) => {
       const { data: empleadosData } = await query
 
       if (empleadosData) {
-        const totalEmpleados = empleadosData.length
-        setMetrics((prev) => [
-          {
-            ...prev[0],
-            value: totalEmpleados.toString(),
-            progress: (totalEmpleados / 4) * 100,
-          },
-          ...prev.slice(1),
-        ])
-
         // Cargar asistencias del día para determinar estado (usando zona horaria de Costa Rica)
         const hoy = getCostaRicaDateString()
         
@@ -1544,19 +1898,20 @@ const SupervisionPanel = ({ sessionInfo }) => {
           .select('*')
           .eq('Activa', true)
 
-        const empleadosConEstado = empleadosData.map((emp) => {
+        const empleadosConEstado = await Promise.all(empleadosData.map(async (emp) => {
           const asistencia = asistenciasData?.find((a) => a.EmpleadoId === emp.Id)
           const tienePermiso = empleadosConPermiso.has(emp.Id)
           
-          // Obtener horario laboral del empleado
-          const empleadoConHorario = empleadosConHorario?.find(e => e.Id === emp.Id)
-          const horarioLaboral = empleadoConHorario?.HorarioLaboral
+          // Obtener horario laboral del empleado usando función helper
+          const horarioLaboral = await obtenerHorarioLaboralEmpleado(emp.Id)
           
-          // Verificar si hoy es día laboral según el horario
-          let esDiaLaboralHoy = false
-          if (horarioLaboral) {
-            esDiaLaboralHoy = esDiaLaboral(horarioLaboral, hoy)
-          }
+          // Determinar estado de asistencia usando función helper centralizada
+          const estadoAsistencia = determinarEstadoAsistencia(
+            horarioLaboral,
+            hoy,
+            asistencia,
+            tienePermiso
+          )
           
           // Buscar pausa activa para este empleado
           const pausaActiva = pausasData?.find((p) => p.AsistenciaId === asistencia?.Id)
@@ -1582,56 +1937,80 @@ const SupervisionPanel = ({ sessionInfo }) => {
               status: esVacaciones ? 'En Vacaciones' : 'En Permiso',
               color: 'warning',
               asistenciaId: asistencia?.Id || null,
-              tiempoRestante: tiempoRestante
+              tiempoRestante: tiempoRestante,
+              tienePausaActiva: !!pausaActiva
             }
           }
           
-          // Si no es día laboral según el horario, no mostrar como ausente
-          if (!esDiaLaboralHoy) {
+          // Usar estados determinados por la función helper
+          const esActivo = estadoAsistencia.esPresente
+          
+          // Si tiene pausa activa de "Mi tiempo", verificar si está pausada o activa
+          if (pausaActiva && esActivo) {
+            // Si la pausa está pausada, mostrar como "Activo"
+            // Si la pausa está activa (no pausada), mostrar como "En Pausa"
+            const estaPausada = pausaActiva.Pausada === true
             return {
               id: emp.Id,
               name: emp.NombreCompleto,
-              status: 'No laboral',
-              color: 'secondary',
+              status: estaPausada ? 'Activo' : 'En Pausa',
+              color: estaPausada ? 'success' : 'warning',
               asistenciaId: asistencia?.Id || null,
-              tiempoRestante: tiempoRestante
+              tiempoRestante: tiempoRestante,
+              tienePausaActiva: true,
+              pausaPausada: estaPausada
             }
-          }
-          
-          // Considerar activo si tiene asistencia con estado Presente Y tiene hora de entrada registrada
-          // Esto asegura que solo aparezcan como activos los que realmente iniciaron sesión hoy
-          const tieneHoraEntrada = asistencia?.HoraEntrada !== null && asistencia?.HoraEntrada !== undefined
-          const esActivo = asistencia?.Estado === 'Presente' && tieneHoraEntrada
-          
-          // Debug: Log para verificar el estado
-          if (emp.NombreCompleto === 'gfdshbsfdt' || emp.NombreCompleto.toLowerCase().includes('gfd')) {
-            console.log('Debug empleado:', {
-              nombre: emp.NombreCompleto,
-              tieneAsistencia: !!asistencia,
-              estado: asistencia?.Estado,
-              horaEntrada: asistencia?.HoraEntrada,
-              tieneHoraEntrada,
-              esActivo
-            })
           }
           
           return {
             id: emp.Id,
             name: emp.NombreCompleto,
-            status: esActivo ? 'Activo' : 'Ausente',
-            color: esActivo ? 'success' : 'danger',
+            status: esActivo ? 'Activo' : (estadoAsistencia.esAusente ? 'Ausente' : 'No laboral'),
+            color: esActivo ? 'success' : (estadoAsistencia.esAusente ? 'danger' : 'secondary'),
             asistenciaId: asistencia?.Id || null,
+            tiempoRestante: tiempoRestante,
+            tienePausaActiva: !!pausaActiva
           }
-        })
+        }))
+
+        // Calcular métricas
+        const totalEmpleados = empleadosData.length
+        const empleadosActivos = empleadosConEstado.filter((e) => e.status === 'Activo').length
+        const empleadosEnPausa = empleadosConEstado.filter((e) => e.status === 'En Pausa').length
+        const empleadosAusentes = empleadosConEstado.filter((e) => 
+          e.status === 'Ausente' && e.color === 'danger'
+        ).length
 
         setLiveAgents(empleadosConEstado)
-        setMetrics((prev) => [
-          prev[0],
+        setMetrics([
           {
-            ...prev[1],
-            value: empleadosConEstado.filter((e) => e.status === 'Activo').length.toString(),
+            label: 'Empleados supervisados',
+            value: totalEmpleados.toString(),
+            hint: `Capacidad total ${totalEmpleados}`,
+            tone: 'primary',
+            progress: totalEmpleados > 0 ? Math.min((totalEmpleados / Math.max(totalEmpleados, 4)) * 100, 100) : 0,
           },
-          ...prev.slice(2),
+          {
+            label: 'Activos ahora',
+            value: empleadosActivos.toString(),
+            hint: 'Actualizado hace unos segundos',
+            tone: 'success',
+            progress: totalEmpleados > 0 ? (empleadosActivos / totalEmpleados) * 100 : 0,
+          },
+          {
+            label: 'En pausa',
+            value: empleadosEnPausa.toString(),
+            hint: empleadosEnPausa > 0 ? `${empleadosEnPausa} empleado${empleadosEnPausa > 1 ? 's' : ''} en receso` : 'Sin recesos vigentes',
+            tone: 'warning',
+            progress: totalEmpleados > 0 ? (empleadosEnPausa / totalEmpleados) * 100 : 0,
+          },
+          {
+            label: 'Ausentes',
+            value: empleadosAusentes.toString(),
+            hint: empleadosAusentes > 0 ? `${empleadosAusentes} empleado${empleadosAusentes > 1 ? 's' : ''} sin asistencia` : 'Todo el equipo presente',
+            tone: 'danger',
+            progress: totalEmpleados > 0 ? (empleadosAusentes / totalEmpleados) * 100 : 0,
+          },
         ])
       }
 
@@ -1659,6 +2038,23 @@ const SupervisionPanel = ({ sessionInfo }) => {
       )
       .subscribe()
     
+    // Suscripción en tiempo real para actualizar cuando cambien las pausas
+    const channelPausas = supabase
+      .channel('pausas-supervision-changes')
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'Pausas'
+        },
+        () => {
+          // Recargar datos cuando haya cambios en pausas
+          cargarDatos()
+        }
+      )
+      .subscribe()
+    
     // Actualizar datos cada 10 segundos como respaldo
     const interval = setInterval(() => {
       cargarDatos()
@@ -1667,6 +2063,7 @@ const SupervisionPanel = ({ sessionInfo }) => {
     return () => {
       clearInterval(interval)
       supabase.removeChannel(channelAsistencias)
+      supabase.removeChannel(channelPausas)
     }
   }, [isSupervisor, proyectoSupervisado])
   
@@ -1707,16 +2104,6 @@ const SupervisionPanel = ({ sessionInfo }) => {
       const { data: empleadosData } = await query
 
       if (empleadosData) {
-        const totalEmpleados = empleadosData.length
-        setMetrics((prev) => [
-          {
-            ...prev[0],
-            value: totalEmpleados.toString(),
-            progress: (totalEmpleados / 4) * 100,
-          },
-          ...prev.slice(1),
-        ])
-
         // Cargar asistencias del día para determinar estado (usando zona horaria de Costa Rica)
         const hoy = getCostaRicaDateString()
         
@@ -1749,19 +2136,20 @@ const SupervisionPanel = ({ sessionInfo }) => {
           .select('*')
           .eq('Activa', true)
 
-        const empleadosConEstado = empleadosData.map((emp) => {
+        const empleadosConEstado = await Promise.all(empleadosData.map(async (emp) => {
           const asistencia = asistenciasData?.find((a) => a.EmpleadoId === emp.Id)
           const tienePermiso = empleadosConPermiso.has(emp.Id)
           
-          // Obtener horario laboral del empleado
-          const empleadoConHorario = empleadosConHorario?.find(e => e.Id === emp.Id)
-          const horarioLaboral = empleadoConHorario?.HorarioLaboral
+          // Obtener horario laboral del empleado usando función helper
+          const horarioLaboral = await obtenerHorarioLaboralEmpleado(emp.Id)
           
-          // Verificar si hoy es día laboral según el horario
-          let esDiaLaboralHoy = false
-          if (horarioLaboral) {
-            esDiaLaboralHoy = esDiaLaboral(horarioLaboral, hoy)
-          }
+          // Determinar estado de asistencia usando función helper centralizada
+          const estadoAsistencia = determinarEstadoAsistencia(
+            horarioLaboral,
+            hoy,
+            asistencia,
+            tienePermiso
+          )
           
           // Buscar pausa activa para este empleado
           const pausaActiva = pausasData?.find((p) => p.AsistenciaId === asistencia?.Id)
@@ -1787,44 +2175,80 @@ const SupervisionPanel = ({ sessionInfo }) => {
               status: esVacaciones ? 'En Vacaciones' : 'En Permiso',
               color: 'warning',
               asistenciaId: asistencia?.Id || null,
-              tiempoRestante: tiempoRestante
+              tiempoRestante: tiempoRestante,
+              tienePausaActiva: !!pausaActiva
             }
           }
           
-          // Si no es día laboral según el horario, no mostrar como ausente
-          if (!esDiaLaboralHoy) {
+          // Usar estados determinados por la función helper
+          const esActivo = estadoAsistencia.esPresente
+          
+          // Si tiene pausa activa de "Mi tiempo", verificar si está pausada o activa
+          if (pausaActiva && esActivo) {
+            // Si la pausa está pausada, mostrar como "Activo"
+            // Si la pausa está activa (no pausada), mostrar como "En Pausa"
+            const estaPausada = pausaActiva.Pausada === true
             return {
               id: emp.Id,
               name: emp.NombreCompleto,
-              status: 'No laboral',
-              color: 'secondary',
+              status: estaPausada ? 'Activo' : 'En Pausa',
+              color: estaPausada ? 'success' : 'warning',
               asistenciaId: asistencia?.Id || null,
-              tiempoRestante: tiempoRestante
+              tiempoRestante: tiempoRestante,
+              tienePausaActiva: true,
+              pausaPausada: estaPausada
             }
           }
-          
-          // Considerar activo si tiene asistencia con estado Presente Y tiene hora de entrada registrada
-          const tieneHoraEntrada = asistencia?.HoraEntrada !== null && asistencia?.HoraEntrada !== undefined
-          const esActivo = asistencia?.Estado === 'Presente' && tieneHoraEntrada
           
           return {
             id: emp.Id,
             name: emp.NombreCompleto,
-            status: esActivo ? 'Activo' : 'Ausente',
-            color: esActivo ? 'success' : 'danger',
+            status: esActivo ? 'Activo' : (estadoAsistencia.esAusente ? 'Ausente' : 'No laboral'),
+            color: esActivo ? 'success' : (estadoAsistencia.esAusente ? 'danger' : 'secondary'),
             asistenciaId: asistencia?.Id || null,
-            tiempoRestante: tiempoRestante
+            tiempoRestante: tiempoRestante,
+            tienePausaActiva: !!pausaActiva
           }
-        })
+        }))
+
+        // Calcular métricas
+        const totalEmpleados = empleadosData.length
+        const empleadosActivos = empleadosConEstado.filter((e) => e.status === 'Activo').length
+        const empleadosEnPausa = empleadosConEstado.filter((e) => e.status === 'En Pausa').length
+        const empleadosAusentes = empleadosConEstado.filter((e) => 
+          e.status === 'Ausente' && e.color === 'danger'
+        ).length
 
         setLiveAgents(empleadosConEstado)
-        setMetrics((prev) => [
-          prev[0],
+        setMetrics([
           {
-            ...prev[1],
-            value: empleadosConEstado.filter((e) => e.status === 'Activo').length.toString(),
+            label: 'Empleados supervisados',
+            value: totalEmpleados.toString(),
+            hint: `Capacidad total ${totalEmpleados}`,
+            tone: 'primary',
+            progress: totalEmpleados > 0 ? Math.min((totalEmpleados / Math.max(totalEmpleados, 4)) * 100, 100) : 0,
           },
-          ...prev.slice(2),
+          {
+            label: 'Activos ahora',
+            value: empleadosActivos.toString(),
+            hint: 'Actualizado hace unos segundos',
+            tone: 'success',
+            progress: totalEmpleados > 0 ? (empleadosActivos / totalEmpleados) * 100 : 0,
+          },
+          {
+            label: 'En pausa',
+            value: empleadosEnPausa.toString(),
+            hint: empleadosEnPausa > 0 ? `${empleadosEnPausa} empleado${empleadosEnPausa > 1 ? 's' : ''} en receso` : 'Sin recesos vigentes',
+            tone: 'warning',
+            progress: totalEmpleados > 0 ? (empleadosEnPausa / totalEmpleados) * 100 : 0,
+          },
+          {
+            label: 'Ausentes',
+            value: empleadosAusentes.toString(),
+            hint: empleadosAusentes > 0 ? `${empleadosAusentes} empleado${empleadosAusentes > 1 ? 's' : ''} sin asistencia` : 'Todo el equipo presente',
+            tone: 'danger',
+            progress: totalEmpleados > 0 ? (empleadosAusentes / totalEmpleados) * 100 : 0,
+          },
         ])
       }
 
@@ -1916,18 +2340,42 @@ const SupervisionPanel = ({ sessionInfo }) => {
             <span className="badge badge-soft">Tiempo real</span>
           </div>
           <div className="live-list">
-            {liveAgents.map((agent) => (
-              <article key={agent.name} className="live-card">
-                <div className="agent-avatar">{agent.name[0]}</div>
-                <div className="live-info">
-                  <p className="live-name">{agent.name}</p>
-                  <div className="live-details">
-                    <div className="status-pill">
-                      <span
-                        className={`status-dot status-${agent.color}`}
-                        aria-hidden="true"
-                      />
-                      <span>Estado: {agent.status}</span>
+            {liveAgents.map((agent) => {
+              // Formatear tiempo restante si existe
+              const formatearTiempo = (segundos) => {
+                if (!segundos || segundos <= 0) return null
+                const minutos = Math.floor(segundos / 60)
+                const segs = segundos % 60
+                return `${String(minutos).padStart(2, '0')}:${String(segs).padStart(2, '0')}`
+              }
+              
+              const tiempoFormateado = agent.tiempoRestante !== null && agent.tiempoRestante !== undefined
+                ? formatearTiempo(agent.tiempoRestante)
+                : null
+              
+              return (
+                <article key={agent.name} className="live-card">
+                  <div className="agent-avatar">{agent.name[0]}</div>
+                  <div className="live-info">
+                    <p className="live-name">{agent.name}</p>
+                    <div className="live-details">
+                      <div className="status-pill">
+                        <span
+                          className={`status-dot status-${agent.color}`}
+                          aria-hidden="true"
+                        />
+                        <span>Estado: {agent.status}</span>
+                      </div>
+                      {tiempoFormateado && agent.tienePausaActiva && (
+                        <div style={{ 
+                          marginTop: '8px', 
+                          fontSize: '0.875rem', 
+                          color: '#666',
+                          fontWeight: '500'
+                        }}>
+                          ⏱️ Tiempo restante: <strong style={{ color: '#1976d2' }}>{tiempoFormateado}</strong>
+                        </div>
+                      )}
                     </div>
                     <div style={{ display: 'flex', gap: '8px', marginTop: '10px' }}>
                       <button
@@ -1947,9 +2395,9 @@ const SupervisionPanel = ({ sessionInfo }) => {
                       </button>
                     </div>
                   </div>
-                </div>
-              </article>
-            ))}
+                </article>
+              )
+            })}
           </div>
         </div>
 
@@ -2394,12 +2842,17 @@ const HomePanel = ({ displayName, sessionInfo }) => {
 
   // Obtener o crear asistencia del día y proyecto del empleado
   useEffect(() => {
-    if (!user?.email) return
+    console.log('🚀 HomePanel useEffect - Iniciando obtención de asistencia', { email: user?.email })
+    if (!user?.email) {
+      console.warn('⚠️ No hay email de usuario')
+      return
+    }
 
     const obtenerAsistencia = async () => {
       try {
         // Buscar usuario por email (case-insensitive usando NormalizedEmail)
         const emailNormalizado = user.email.toUpperCase()
+        console.log('🔍 Buscando usuario:', emailNormalizado)
         const { data: usuario, error: errorUsuario } = await supabase
           .from('Usuarios')
           .select('EmpleadoId')
@@ -2407,9 +2860,11 @@ const HomePanel = ({ displayName, sessionInfo }) => {
           .single()
 
         if (errorUsuario || !usuario?.EmpleadoId) {
-          console.error('Error al obtener empleado:', errorUsuario)
+          console.error('❌ Error al obtener empleado:', errorUsuario)
           return
         }
+
+        console.log('👤 Usuario encontrado:', usuario)
 
         // Obtener proyecto y horario del empleado
         const { data: empleado } = await supabase
@@ -2418,59 +2873,94 @@ const HomePanel = ({ displayName, sessionInfo }) => {
           .eq('Id', usuario.EmpleadoId)
           .single()
 
+        console.log('👔 Empleado encontrado:', empleado)
+
         if (empleado) {
           setProyectoEmpleado(empleado.ProyectoAsignado)
         }
 
         // Obtener fecha actual en zona horaria de Costa Rica
         const hoy = getCostaRicaDateString()
+        console.log('📅 Fecha de hoy (GMT-6):', hoy)
 
         // Verificar si tiene permiso aprobado para hoy
         const tienePermiso = await tienePermisoAprobado(usuario.EmpleadoId, hoy)
         
         if (tienePermiso) {
+          console.log('🏖️ Tiene permiso aprobado, no se crea asistencia')
           // Si tiene permiso aprobado, no crear asistencia
           return
         }
 
         // VERIFICAR SI ES DÍA LABORAL SEGÚN EL HORARIO
         if (!empleado?.HorarioLaboral) {
+          console.log('⚠️ No tiene horario laboral configurado')
           // Si no tiene horario, no crear asistencia
           return
         }
 
         const esDiaLaboralHoy = esDiaLaboral(empleado.HorarioLaboral, hoy)
+        console.log('📆 ¿Es día laboral?', esDiaLaboralHoy)
         if (!esDiaLaboralHoy) {
+          console.log('🏠 No es día laboral según horario')
           // Si no es día laboral según el horario, no crear asistencia
           return
         }
 
         // Buscar asistencia de hoy
+        console.log('🔍 Buscando asistencia:', { empleadoId: usuario.EmpleadoId, fecha: hoy })
         const { data: asistencia, error: errorAsistencia } = await supabase
           .from('Asistencias')
-          .select('Id, HoraEntrada')
+          .select('Id, HoraEntrada, Estado')
           .eq('EmpleadoId', usuario.EmpleadoId)
           .eq('Fecha', hoy)
           .maybeSingle()
 
+        console.log('📋 Resultado búsqueda asistencia:', { asistencia, error: errorAsistencia })
+
         if (asistencia) {
+          console.log('✅ Asistencia encontrada, estableciendo ID:', asistencia.Id)
           setAsistenciaId(asistencia.Id)
           // La hora de entrada ya se registró al iniciar sesión, no se actualiza aquí
         } else {
-          // Si no existe asistencia y es día laboral, crear el registro sin hora de entrada
-          // La hora de entrada se registra solo al iniciar sesión
-          const { data: nuevaAsistencia, error: errorCrear } = await supabase
+          console.log('⚠️ No existe asistencia todavía...')
+          // Esperar un momento por si se está registrando la asistencia
+          console.log('⏳ Esperando 2 segundos y reintentando...')
+          await new Promise(resolve => setTimeout(resolve, 2000))
+          
+          // Reintentar búsqueda
+          const { data: asistenciaRetry } = await supabase
             .from('Asistencias')
-            .insert({
-              EmpleadoId: usuario.EmpleadoId,
-              Fecha: hoy,
-              Estado: 'Presente'
-            })
-            .select('Id')
-            .single()
+            .select('Id, HoraEntrada, Estado')
+            .eq('EmpleadoId', usuario.EmpleadoId)
+            .eq('Fecha', hoy)
+            .maybeSingle()
+          
+          if (asistenciaRetry) {
+            console.log('✅ Asistencia encontrada en reintento:', asistenciaRetry.Id)
+            setAsistenciaId(asistenciaRetry.Id)
+          } else {
+            console.log('⚠️ No existe asistencia después del reintento, creando una nueva...')
+            // Si después del reintento sigue sin existir, crear el registro sin hora de entrada
+            // La hora de entrada se registra solo al iniciar sesión
+            const { data: nuevaAsistencia, error: errorCrear } = await supabase
+              .from('Asistencias')
+              .insert({
+                EmpleadoId: usuario.EmpleadoId,
+                Fecha: hoy,
+                Estado: 'Presente'
+              })
+              .select('Id')
+              .single()
 
-          if (nuevaAsistencia && !errorCrear) {
-            setAsistenciaId(nuevaAsistencia.Id)
+            console.log('📝 Nueva asistencia creada:', { nuevaAsistencia, error: errorCrear })
+
+            if (nuevaAsistencia && !errorCrear) {
+              console.log('✅ Nueva asistencia ID establecido:', nuevaAsistencia.Id)
+              setAsistenciaId(nuevaAsistencia.Id)
+            } else {
+              console.error('❌ Error al crear asistencia:', errorCrear)
+            }
           }
         }
       } catch (err) {
@@ -2659,34 +3149,29 @@ const HomePanel = ({ displayName, sessionInfo }) => {
       return
     }
 
-    // CALCULAR el tiempo restante desde la BD, no desde el cliente
+    // CALCULAR el tiempo restante desde la BD usando función helper
     const calcularTiempoRestante = () => {
-      const ahora = getCostaRicaTime()
-      const inicio = toCostaRicaDate(pausaActiva.HoraInicio) || new Date(pausaActiva.HoraInicio)
-      const tiempoTranscurrido = Math.floor((ahora - inicio) / 1000) // segundos transcurridos
-      const tiempoPausado = pausaActiva.TiempoPausadoAcumulado || 0
-      const tiempoActivo = tiempoTranscurrido - tiempoPausado // tiempo que ha estado activa
-      const tiempoRestante = Math.max(0, 3600 - tiempoActivo) // 60 minutos = 3600 segundos
-      
-      return tiempoRestante
+      return calcularTiempoRestantePausa(pausaActiva)
     }
 
     // Actualizar el tiempo cada segundo CALCULÁNDOLO desde la BD
-    const actualizarTiempo = () => {
+    const actualizarTiempo = async () => {
+      // Recalcular desde la BD para asegurar precisión
       const tiempoRestante = calcularTiempoRestante()
       setTiempoRestanteSegundos(tiempoRestante)
 
-      // Guardar en BD solo cada 5 segundos para reducir carga
-      if (tiempoRestante % 5 === 0) {
-        supabase
+      // Guardar en BD cada 5 segundos para reducir carga y mantener sincronización
+      const ahora = Date.now()
+      if (!actualizarTiempo.ultimaActualizacion || ahora - actualizarTiempo.ultimaActualizacion >= 5000) {
+        actualizarTiempo.ultimaActualizacion = ahora
+        const { error } = await supabase
           .from('Pausas')
           .update({ TiempoRestanteSegundos: tiempoRestante })
           .eq('Id', pausaActiva.Id)
-          .then(({ error }) => {
-            if (error) {
-              console.error('Error al guardar tiempo en BD:', error)
-            }
-          })
+        
+        if (error) {
+          console.error('Error al guardar tiempo en BD:', error)
+        }
       }
 
       if (tiempoRestante <= 0) {
@@ -2707,13 +3192,55 @@ const HomePanel = ({ displayName, sessionInfo }) => {
 
   // Iniciar o reanudar pausa
   const iniciarPausa = async () => {
-    if (!asistenciaId) {
-      alert('No se pudo obtener la asistencia. Por favor, intenta de nuevo.')
+    // Si no hay asistenciaId, intentar obtenerlo
+    let asistenciaIdParaUsar = asistenciaId
+    
+    if (!asistenciaIdParaUsar) {
+      console.log('No hay asistenciaId, intentando obtenerlo...')
+      try {
+        const hoy = getCostaRicaDateString()
+        const emailNormalizado = user?.email?.toUpperCase()
+        if (emailNormalizado) {
+          const { data: usuario } = await supabase
+            .from('Usuarios')
+            .select('EmpleadoId')
+            .eq('NormalizedEmail', emailNormalizado)
+            .single()
+          
+          if (usuario?.EmpleadoId) {
+            const { data: asistencia } = await supabase
+              .from('Asistencias')
+              .select('Id')
+              .eq('EmpleadoId', usuario.EmpleadoId)
+              .eq('Fecha', hoy)
+              .maybeSingle()
+            
+            if (asistencia?.Id) {
+              asistenciaIdParaUsar = asistencia.Id
+              setAsistenciaId(asistencia.Id)
+              console.log('AsistenciaId obtenido:', asistenciaIdParaUsar)
+            } else {
+              alert('No se encontró asistencia para hoy. Por favor, verifica que tengas una asistencia registrada.')
+              return
+            }
+          }
+        }
+      } catch (err) {
+        console.error('Error al obtener asistencia:', err)
+        alert('No se pudo obtener la asistencia. Por favor, intenta de nuevo.')
+        return
+      }
+    }
+
+    if (!asistenciaIdParaUsar) {
+      alert('No se pudo obtener la asistencia. Por favor, verifica que tengas una asistencia registrada para hoy.')
       return
     }
 
     setLoading(true)
     try {
+      console.log('Iniciando pausa con asistenciaId:', asistenciaIdParaUsar)
+      
       // Si hay una pausa activa pero pausada, reanudarla
       if (pausaActiva && pausaActiva.Pausada) {
         const ahora = getCostaRicaTime()
@@ -2754,12 +3281,65 @@ const HomePanel = ({ displayName, sessionInfo }) => {
         setPausaActiva(pausaNormalizada)
         setTiempoRestanteSegundos(tiempoRestante)
       } else if (!pausaActiva) {
-        // Crear nueva pausa
-        const tiempoInicial = 3600
+        // Verificar si hay una pausa activa del día de hoy (por si acaso)
+        const hoy = getCostaRicaDateString()
+        const { data: asistenciaHoy } = await supabase
+          .from('Asistencias')
+          .select('Id, EmpleadoId')
+          .eq('Id', asistenciaIdParaUsar)
+          .eq('Fecha', hoy)
+          .maybeSingle()
+        
+        // Buscar pausa activa de hoy
+        let tiempoInicial = 3600
+        if (asistenciaHoy) {
+          const { data: pausaHoy } = await supabase
+            .from('Pausas')
+            .select('*')
+            .eq('AsistenciaId', asistenciaHoy.Id)
+            .eq('Activa', true)
+            .eq('TipoPausa', 'Mi tiempo')
+            .order('HoraInicio', { ascending: false })
+            .limit(1)
+            .maybeSingle()
+          
+          if (pausaHoy) {
+            // Si existe pausa de hoy, usar su tiempo restante calculado
+            tiempoInicial = calcularTiempoRestantePausa(pausaHoy) || 3600
+          } else {
+            // Si no hay pausa de hoy, verificar si hay tiempo restante del día anterior
+            const tiempoAyer = await obtenerTiempoRestanteDiaAnterior(asistenciaHoy.EmpleadoId)
+            if (tiempoAyer !== null && tiempoAyer > 0) {
+              tiempoInicial = tiempoAyer
+            }
+          }
+        } else {
+        // Si no hay asistencia de hoy, buscar EmpleadoId desde la asistenciaId
+          const { data: asistenciaData } = await supabase
+            .from('Asistencias')
+            .select('EmpleadoId')
+            .eq('Id', asistenciaIdParaUsar)
+            .maybeSingle()
+        
+        if (asistenciaData) {
+          const tiempoAyer = await obtenerTiempoRestanteDiaAnterior(asistenciaData.EmpleadoId)
+          if (tiempoAyer !== null && tiempoAyer > 0) {
+            tiempoInicial = tiempoAyer
+          }
+        }
+      }
+        
+        // Crear nueva pausa con el tiempo inicial calculado
+        console.log('Creando nueva pausa con:', {
+          AsistenciaId: asistenciaIdParaUsar,
+          TipoPausa: 'Mi tiempo',
+          tiempoInicial
+        })
+        
         const { data, error } = await supabase
           .from('Pausas')
           .insert({
-            AsistenciaId: asistenciaId,
+            AsistenciaId: asistenciaIdParaUsar,
             TipoPausa: 'Mi tiempo',
             HoraInicio: getCostaRicaTime().toISOString(),
             Activa: true,
@@ -2770,7 +3350,12 @@ const HomePanel = ({ displayName, sessionInfo }) => {
           .select()
           .single()
 
-        if (error) throw error
+        if (error) {
+          console.error('Error al crear pausa:', error)
+          throw error
+        }
+        
+        console.log('Pausa creada exitosamente:', data)
         
         // Normalizar valores
         const pausaNormalizada = {
@@ -2906,7 +3491,7 @@ const HomePanel = ({ displayName, sessionInfo }) => {
                 type="button"
                 className="btn btn-primary pill"
                 onClick={pausarPausa}
-                disabled={loading || !asistenciaId}
+                disabled={loading}
               >
                 {loading ? 'Pausando...' : 'Pausar'}
               </button>
@@ -2915,13 +3500,16 @@ const HomePanel = ({ displayName, sessionInfo }) => {
                 type="button"
                 className="btn btn-primary pill"
                 onClick={iniciarPausa}
-                disabled={loading || !asistenciaId}
+                disabled={loading}
+                title={!asistenciaId ? 'Esperando asistencia...' : ''}
               >
                 {loading
                   ? 'Iniciando...'
-                  : pausaActiva && pausaActiva.Pausada === true
-                    ? 'Reanudar'
-                    : 'Iniciar Receso'}
+                  : !asistenciaId
+                    ? 'Esperando asistencia...'
+                    : pausaActiva && pausaActiva.Pausada === true
+                      ? 'Reanudar'
+                      : 'Iniciar Receso'}
               </button>
             )}
           </div>
@@ -3550,6 +4138,8 @@ const UsersPanel = () => {
   const [showResetPasswordModal, setShowResetPasswordModal] = useState(false)
   const [showEditModal, setShowEditModal] = useState(false)
   const [showEditScheduleModal, setShowEditScheduleModal] = useState(false)
+  const [showDeleteConfirmModal, setShowDeleteConfirmModal] = useState(false)
+  const [userToDelete, setUserToDelete] = useState(null)
   const [selectedUser, setSelectedUser] = useState(null)
   const [newPassword, setNewPassword] = useState('')
   const [editFormData, setEditFormData] = useState(null)
@@ -4056,34 +4646,19 @@ const UsersPanel = () => {
         return
       }
 
-      // Calcular nueva tardía con el horario actualizado
-      // Convertir hora de entrada a hora de Costa Rica
-      const horaEntradaReal = toCostaRicaDate(asistencia.HoraEntrada) || new Date(asistencia.HoraEntrada)
-      const horaEsperadaData = obtenerHoraEntradaEsperada(JSON.stringify(nuevoHorario), hoy)
+      // Parsear el horario si viene como string
+      const horarioLaboral = typeof nuevoHorario === 'string' 
+        ? JSON.parse(nuevoHorario) 
+        : nuevoHorario
+
+      // Calcular nueva tardía usando función helper centralizada
+      const minutosTardia = calcularTardiaEmpleado(
+        horarioLaboral, 
+        hoy, 
+        asistencia.HoraEntrada
+      )
       
-      let minutosTardia = 0
-      
-      if (horaEsperadaData) {
-        // Obtener componentes de hora de la entrada real (en zona horaria de Costa Rica)
-        // Usar toLocaleString para obtener la hora en zona horaria de Costa Rica
-        const horaRealStr = horaEntradaReal.toLocaleString('en-US', { 
-          timeZone: 'Etc/GMT+6',
-          hour: '2-digit',
-          minute: '2-digit',
-          hour12: false
-        })
-        const [horaReal, minutoReal] = horaRealStr.split(':').map(Number)
-        
-        // Calcular diferencia en minutos directamente
-        const minutosReal = horaReal * 60 + minutoReal
-        const minutosEsperados = horaEsperadaData.hora * 60 + horaEsperadaData.minuto
-        
-        // Calcular tardía (solo si llegó después de la hora esperada)
-        const diferencia = minutosReal - minutosEsperados
-        minutosTardia = diferencia > 0 ? diferencia : 0
-        
-        console.log(`Nueva tardía calculada: ${minutosTardia} minutos`)
-      }
+      console.log(`Nueva tardía calculada: ${minutosTardia} minutos`)
 
       // Actualizar la asistencia con los nuevos minutos de tardía
       const { error: updateError } = await supabase
@@ -4093,8 +4668,6 @@ const UsersPanel = () => {
 
       if (updateError) {
         console.error('Error al actualizar minutos de tardía:', updateError)
-      } else {
-        console.log('✅ Minutos de tardía actualizados correctamente:', minutosTardia)
       }
     } catch (err) {
       console.error('Error al recalcular tardía:', err)
@@ -4359,33 +4932,34 @@ const UsersPanel = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editFormData, editScheduleData, showEditModal])
 
-  // Eliminar usuario
-  const handleDeleteUser = async (usuario) => {
-    const mensajeConfirmacion = usuario.EmpleadoId 
-      ? `¿Estás seguro de eliminar al usuario ${usuario.NombreCompleto} y su empleado asociado? Esta acción no se puede deshacer.`
-      : `¿Estás seguro de eliminar al usuario ${usuario.NombreCompleto}? Esta acción no se puede deshacer.`
-    
-    if (!window.confirm(mensajeConfirmacion)) {
-      return
-    }
+  // Abrir modal de confirmación para eliminar usuario
+  const handleDeleteUser = (usuario) => {
+    setUserToDelete(usuario)
+    setShowDeleteConfirmModal(true)
+  }
+
+  // Confirmar y ejecutar eliminación de usuario
+  const confirmDeleteUser = async () => {
+    if (!userToDelete) return
 
     setLoading(true)
     setError('')
     setMessage('')
+    setShowDeleteConfirmModal(false)
 
     try {
       // Obtener EmpleadoId antes de eliminar el usuario
-      const empleadoId = usuario.EmpleadoId
+      const empleadoId = userToDelete.EmpleadoId
 
       // Eliminar de Auth
-      const { error: authError } = await supabaseAdmin.auth.admin.deleteUser(usuario.Id)
+      const { error: authError } = await supabaseAdmin.auth.admin.deleteUser(userToDelete.Id)
       if (authError) throw authError
 
       // Eliminar de tabla Usuarios
       const { error: usuarioError } = await supabase
         .from('Usuarios')
         .delete()
-        .eq('Id', usuario.Id)
+        .eq('Id', userToDelete.Id)
 
       if (usuarioError) throw usuarioError
 
@@ -4408,6 +4982,7 @@ const UsersPanel = () => {
       }
 
       recargarUsuarios()
+      setUserToDelete(null)
       setTimeout(() => setMessage(''), 3000)
     } catch (err) {
       console.error('Error al eliminar usuario:', err)
@@ -4422,7 +4997,7 @@ const UsersPanel = () => {
   const esSupervisor = () => {
     return rolesSeleccionados.some(roleId => {
       const rol = roles.find(r => r.Id === roleId)
-      return rol?.Name === 'Supervisor de Personal' || rol?.NormalizedName === 'SUPERVISOR DE PERSONAL'
+      return esRolSupervisor(rol)
     })
   }
 
@@ -4727,28 +5302,139 @@ const UsersPanel = () => {
 
   return (
     <div className="section-stack">
-      <div className="panel-header">
-        <div className="panel-title">
-          <span className="title-icon" aria-hidden="true">
-            <IconUser size={24} />
-          </span>
-          <div>
-            <p className="eyebrow">Gestión de Usuarios</p>
-            <h2>Administra usuarios y accesos del sistema</h2>
-            <p className="page-subtitle">
-              Crea y gestiona usuarios del sistema conectados a Supabase.
+      {/* Header Premium */}
+      <div style={{
+        background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+        borderRadius: '16px',
+        padding: '2rem',
+        marginBottom: '2rem',
+        boxShadow: '0 10px 40px rgba(102, 126, 234, 0.3)',
+        color: '#ffffff',
+        position: 'relative',
+        overflow: 'hidden'
+      }}>
+        <div style={{
+          position: 'absolute',
+          top: '-50%',
+          right: '-10%',
+          width: '300px',
+          height: '300px',
+          background: 'rgba(255, 255, 255, 0.1)',
+          borderRadius: '50%',
+          filter: 'blur(60px)'
+        }} />
+        <div style={{
+          position: 'absolute',
+          bottom: '-30%',
+          left: '-5%',
+          width: '200px',
+          height: '200px',
+          background: 'rgba(255, 255, 255, 0.08)',
+          borderRadius: '50%',
+          filter: 'blur(40px)'
+        }} />
+        <div style={{ position: 'relative', zIndex: 1, display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+          <div style={{ flex: 1 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginBottom: '0.75rem' }}>
+              <div style={{
+                width: '56px',
+                height: '56px',
+                borderRadius: '14px',
+                background: 'rgba(255, 255, 255, 0.2)',
+                backdropFilter: 'blur(10px)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                boxShadow: '0 8px 16px rgba(0, 0, 0, 0.1)'
+              }}>
+                <IconUsers size={28} style={{ color: '#ffffff' }} />
+              </div>
+              <div>
+                <p style={{
+                  margin: 0,
+                  fontSize: '0.875rem',
+                  fontWeight: 600,
+                  textTransform: 'uppercase',
+                  letterSpacing: '1px',
+                  opacity: 0.9,
+                  marginBottom: '0.25rem'
+                }}>
+                  Gestión de Usuarios
+                </p>
+                <h2 style={{
+                  margin: 0,
+                  fontSize: '1.875rem',
+                  fontWeight: 700,
+                  lineHeight: 1.2,
+                  marginBottom: '0.5rem'
+                }}>
+                  Administra usuarios y accesos
+                </h2>
+              </div>
+            </div>
+            <p style={{
+              margin: 0,
+              fontSize: '0.9375rem',
+              opacity: 0.95,
+              lineHeight: 1.6,
+              maxWidth: '600px'
+            }}>
+              Crea y gestiona usuarios del sistema con acceso completo a Supabase. Controla permisos, roles y configuraciones de seguridad.
             </p>
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '1.5rem',
+              marginTop: '1.25rem',
+              fontSize: '0.875rem',
+              opacity: 0.9
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <span style={{ fontSize: '1.25rem' }}>👥</span>
+                <span><strong>{usuarios?.length || 0}</strong> usuarios registrados</span>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <span style={{ fontSize: '1.25rem' }}>🔐</span>
+                <span>Gestión de roles y permisos</span>
+              </div>
+            </div>
           </div>
-        </div>
-        <div className="panel-header-meta">
           <button
             type="button"
-            className="btn btn-primary"
             onClick={() => setShowForm(!showForm)}
+            style={{
+              padding: '0.875rem 1.5rem',
+              background: showForm ? 'rgba(255, 255, 255, 0.2)' : '#ffffff',
+              color: showForm ? '#ffffff' : '#667eea',
+              border: 'none',
+              borderRadius: '12px',
+              fontSize: '0.9375rem',
+              fontWeight: 600,
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.5rem',
+              transition: 'all 0.3s ease',
+              boxShadow: showForm ? 'none' : '0 4px 12px rgba(0, 0, 0, 0.15)',
+              backdropFilter: 'blur(10px)'
+            }}
+            onMouseEnter={(e) => {
+              if (!showForm) {
+                e.target.style.transform = 'translateY(-2px)'
+                e.target.style.boxShadow = '0 6px 16px rgba(0, 0, 0, 0.2)'
+              }
+            }}
+            onMouseLeave={(e) => {
+              if (!showForm) {
+                e.target.style.transform = 'translateY(0)'
+                e.target.style.boxShadow = '0 4px 12px rgba(0, 0, 0, 0.15)'
+              }
+            }}
           >
             {showForm ? (
               <>
-                <span style={{ fontSize: '1.2rem', lineHeight: 1 }}>✕</span> Cancelar
+                <span style={{ fontSize: '1.2rem' }}>✕</span>
+                Cancelar
               </>
             ) : (
               <>
@@ -4987,7 +5673,7 @@ const UsersPanel = () => {
 
             {rolesSeleccionados.some(roleId => {
               const rol = roles.find(r => r.Id === roleId)
-              return rol?.Name === 'Supervisor de Personal' || rol?.NormalizedName === 'SUPERVISOR DE PERSONAL'
+              return esRolSupervisor(rol)
             }) ? (
               <label>
                 <span>Proyecto Supervisado *</span>
@@ -5148,8 +5834,58 @@ const UsersPanel = () => {
               </div>
             </label>
 
-            {message && <div className="status success" style={{ gridColumn: '1 / -1', marginTop: '0.5rem' }}>{message}</div>}
-            {error && <div className="status error" style={{ gridColumn: '1 / -1', marginTop: '0.5rem' }}>{error}</div>}
+            {message && (
+              <div style={{
+                gridColumn: '1 / -1',
+                marginTop: '0.75rem',
+                padding: '1rem 1.25rem',
+                background: 'linear-gradient(135deg, #d1fae5 0%, #a7f3d0 100%)',
+                border: '2px solid #10b981',
+                borderRadius: '12px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.75rem',
+                boxShadow: '0 4px 12px rgba(16, 185, 129, 0.15)'
+              }}>
+                <span style={{ fontSize: '1.5rem' }}>✅</span>
+                <div style={{ flex: 1 }}>
+                  <p style={{
+                    margin: 0,
+                    fontSize: '0.9375rem',
+                    fontWeight: 600,
+                    color: '#059669'
+                  }}>
+                    {message}
+                  </p>
+                </div>
+              </div>
+            )}
+            {error && (
+              <div style={{
+                gridColumn: '1 / -1',
+                marginTop: '0.75rem',
+                padding: '1rem 1.25rem',
+                background: 'linear-gradient(135deg, #fee2e2 0%, #fecaca 100%)',
+                border: '2px solid #ef4444',
+                borderRadius: '12px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.75rem',
+                boxShadow: '0 4px 12px rgba(239, 68, 68, 0.15)'
+              }}>
+                <span style={{ fontSize: '1.5rem' }}>⚠️</span>
+                <div style={{ flex: 1 }}>
+                  <p style={{
+                    margin: 0,
+                    fontSize: '0.9375rem',
+                    fontWeight: 600,
+                    color: '#dc2626'
+                  }}>
+                    {error}
+                  </p>
+                </div>
+              </div>
+            )}
 
             <button
               type="submit"
@@ -5173,28 +5909,74 @@ const UsersPanel = () => {
         initialSchedule={scheduleData}
       />
 
-      <div className="section-card filters-card" style={{ marginBottom: '1rem' }}>
-        <div className="filter-row" style={{ display: 'flex', gap: '1rem', alignItems: 'center', flexWrap: 'wrap' }}>
-          <div style={{ flex: '1', minWidth: '250px' }}>
-            <label style={{ display: 'block', marginBottom: '0.5rem', fontSize: '0.875rem', fontWeight: 500, color: '#475569' }}>
+      {/* Sección de Filtros Premium */}
+      <div style={{
+        background: '#ffffff',
+        borderRadius: '16px',
+        padding: '1.5rem',
+        marginBottom: '1.5rem',
+        boxShadow: '0 1px 3px rgba(0, 0, 0, 0.1), 0 1px 2px rgba(0, 0, 0, 0.06)',
+        border: '1px solid #e2e8f0'
+      }}>
+        <div style={{ display: 'flex', gap: '1rem', alignItems: 'flex-end', flexWrap: 'wrap' }}>
+          <div style={{ flex: '1', minWidth: '280px' }}>
+            <label style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.5rem',
+              marginBottom: '0.75rem',
+              fontSize: '0.875rem',
+              fontWeight: 600,
+              color: '#334155'
+            }}>
+              <IconSearch size={16} style={{ color: '#64748b' }} />
               Buscar por nombre completo
             </label>
-            <input
-              type="text"
-              placeholder="Ej: SEBASTIAN ARROLIGA"
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              style={{
-                width: '100%',
-                padding: '0.5rem 0.75rem',
-                border: '1px solid #cbd5e1',
-                borderRadius: '8px',
-                fontSize: '0.875rem'
-              }}
-            />
+            <div style={{ position: 'relative' }}>
+              <input
+                type="text"
+                placeholder="Ej: SEBASTIAN ARROLIGA"
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                style={{
+                  width: '100%',
+                  padding: '0.75rem 1rem 0.75rem 2.75rem',
+                  border: '1px solid #cbd5e1',
+                  borderRadius: '10px',
+                  fontSize: '0.9375rem',
+                  transition: 'all 0.2s',
+                  outline: 'none'
+                }}
+                onFocus={(e) => {
+                  e.target.style.borderColor = '#667eea'
+                  e.target.style.boxShadow = '0 0 0 3px rgba(102, 126, 234, 0.1)'
+                }}
+                onBlur={(e) => {
+                  e.target.style.borderColor = '#cbd5e1'
+                  e.target.style.boxShadow = 'none'
+                }}
+              />
+              <IconSearch size={18} style={{
+                position: 'absolute',
+                left: '0.875rem',
+                top: '50%',
+                transform: 'translateY(-50%)',
+                color: '#94a3b8',
+                pointerEvents: 'none'
+              }} />
+            </div>
           </div>
-          <div style={{ flex: '1', minWidth: '200px' }}>
-            <label style={{ display: 'block', marginBottom: '0.5rem', fontSize: '0.875rem', fontWeight: 500, color: '#475569' }}>
+          <div style={{ flex: '1', minWidth: '220px' }}>
+            <label style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.5rem',
+              marginBottom: '0.75rem',
+              fontSize: '0.875rem',
+              fontWeight: 600,
+              color: '#334155'
+            }}>
+              <span style={{ fontSize: '1.125rem' }}>📁</span>
               Filtrar por proyecto
             </label>
             <select
@@ -5202,11 +5984,22 @@ const UsersPanel = () => {
               onChange={(e) => setFilterProyecto(e.target.value)}
               style={{
                 width: '100%',
-                padding: '0.5rem 0.75rem',
+                padding: '0.75rem 1rem',
                 border: '1px solid #cbd5e1',
-                borderRadius: '8px',
-                fontSize: '0.875rem',
-                backgroundColor: '#fff'
+                borderRadius: '10px',
+                fontSize: '0.9375rem',
+                backgroundColor: '#fff',
+                cursor: 'pointer',
+                transition: 'all 0.2s',
+                outline: 'none'
+              }}
+              onFocus={(e) => {
+                e.target.style.borderColor = '#667eea'
+                e.target.style.boxShadow = '0 0 0 3px rgba(102, 126, 234, 0.1)'
+              }}
+              onBlur={(e) => {
+                e.target.style.borderColor = '#cbd5e1'
+                e.target.style.boxShadow = 'none'
               }}
             >
               <option value="">Todos los proyectos</option>
@@ -5221,13 +6014,34 @@ const UsersPanel = () => {
             <div style={{ display: 'flex', alignItems: 'flex-end' }}>
               <button
                 type="button"
-                className="btn btn-outline btn-small"
                 onClick={() => {
                   setSearchTerm('')
                   setFilterProyecto('')
                 }}
-                style={{ marginTop: '1.5rem' }}
+                style={{
+                  padding: '0.75rem 1.25rem',
+                  background: '#f1f5f9',
+                  color: '#475569',
+                  border: '1px solid #cbd5e1',
+                  borderRadius: '10px',
+                  fontSize: '0.875rem',
+                  fontWeight: 500,
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.5rem',
+                  transition: 'all 0.2s'
+                }}
+                onMouseEnter={(e) => {
+                  e.target.style.background = '#e2e8f0'
+                  e.target.style.borderColor = '#94a3b8'
+                }}
+                onMouseLeave={(e) => {
+                  e.target.style.background = '#f1f5f9'
+                  e.target.style.borderColor = '#cbd5e1'
+                }}
               >
+                <span>🔄</span>
                 Limpiar filtros
               </button>
             </div>
@@ -5235,13 +6049,66 @@ const UsersPanel = () => {
         </div>
       </div>
 
-      <div className="section-card table-card">
-        <div className="split-heading">
-          <h3>Listado de Usuarios</h3>
-          <span className="badge badge-soft">
+      {/* Tabla Premium */}
+      <div style={{
+        background: '#ffffff',
+        borderRadius: '16px',
+        padding: '1.5rem',
+        boxShadow: '0 1px 3px rgba(0, 0, 0, 0.1), 0 1px 2px rgba(0, 0, 0, 0.06)',
+        border: '1px solid #e2e8f0'
+      }}>
+        <div style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          marginBottom: '1.5rem',
+          paddingBottom: '1rem',
+          borderBottom: '2px solid #f1f5f9'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+            <div style={{
+              width: '48px',
+              height: '48px',
+              borderRadius: '12px',
+              background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              boxShadow: '0 4px 12px rgba(102, 126, 234, 0.3)'
+            }}>
+              <IconUsers size={24} style={{ color: '#ffffff' }} />
+            </div>
+            <div>
+              <h3 style={{
+                margin: 0,
+                fontSize: '1.5rem',
+                fontWeight: 700,
+                color: '#1e293b',
+                marginBottom: '0.25rem'
+              }}>
+                Listado de Usuarios
+              </h3>
+              <p style={{
+                margin: 0,
+                fontSize: '0.875rem',
+                color: '#64748b'
+              }}>
+                Gestiona todos los usuarios del sistema
+              </p>
+            </div>
+          </div>
+          <div style={{
+            padding: '0.5rem 1rem',
+            background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+            borderRadius: '12px',
+            color: '#ffffff',
+            fontSize: '0.875rem',
+            fontWeight: 600,
+            boxShadow: '0 4px 12px rgba(102, 126, 234, 0.3)'
+          }}>
             {usuariosFiltrados.length} {usuariosFiltrados.length === 1 ? 'usuario' : 'usuarios'}
             {usuariosFiltrados.length !== (usuarios?.length || 0) && ` de ${usuarios?.length || 0}`}
-          </span>
+          </div>
         </div>
         <div className="table-scroll">
           <table className="data-table">
@@ -5270,10 +6137,31 @@ const UsersPanel = () => {
                   {/* Sección de Supervisores */}
                   {supervisoresFiltrados.length > 0 && (
                     <>
-                      <tr style={{ backgroundColor: '#f0f9ff', borderTop: '2px solid #3b82f6' }}>
-                        <td colSpan="6" style={{ padding: '0.75rem 1rem', fontWeight: '600', color: '#1e40af', fontSize: '0.875rem' }}>
-                          <span style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                            <IconUsers size={16} />
+                      <tr style={{
+                        background: 'linear-gradient(135deg, #667eea15 0%, #764ba215 100%)',
+                        borderTop: '3px solid #667eea'
+                      }}>
+                        <td colSpan="6" style={{
+                          padding: '1rem 1.25rem',
+                          fontWeight: '700',
+                          color: '#667eea',
+                          fontSize: '0.9375rem',
+                          textTransform: 'uppercase',
+                          letterSpacing: '0.5px'
+                        }}>
+                          <span style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                            <div style={{
+                              width: '32px',
+                              height: '32px',
+                              borderRadius: '8px',
+                              background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              boxShadow: '0 2px 8px rgba(102, 126, 234, 0.3)'
+                            }}>
+                              <IconUsers size={18} style={{ color: '#ffffff' }} />
+                            </div>
                             Supervisores ({supervisoresFiltrados.length})
                           </span>
                         </td>
@@ -5299,35 +6187,112 @@ const UsersPanel = () => {
                                 {usuario.Activo ? 'Activo' : 'Inactivo'}
                               </span>
                             </td>
-                            <td className="table-actions">
-                              <button 
-                                type="button" 
-                                className="btn btn-outline btn-small"
-                                onClick={() => {
-                                  setSelectedUser(usuario)
-                                  setNewPassword('')
-                                  setShowResetPasswordModal(true)
-                                }}
-                                title="Restablecer contraseña"
-                              >
-                                <IconEye size={16} />
-                              </button>
-                              <button 
-                                type="button" 
-                                className="btn btn-outline btn-small"
-                                onClick={() => handleEditClick(usuario)}
-                                title="Editar usuario"
-                              >
-                                <IconEdit size={16} />
-                              </button>
-                              <button 
-                                type="button" 
-                                className="btn btn-outline btn-small danger"
-                                onClick={() => handleDeleteUser(usuario)}
-                                title="Eliminar usuario"
-                              >
-                                <IconTrash size={16} />
-                              </button>
+                            <td className="table-actions" style={{ padding: '0.75rem' }}>
+                              <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'center' }}>
+                                <button 
+                                  type="button" 
+                                  onClick={() => {
+                                    setSelectedUser(usuario)
+                                    setNewPassword('')
+                                    setShowResetPasswordModal(true)
+                                  }}
+                                  title="Restablecer contraseña"
+                                  style={{
+                                    width: '36px',
+                                    height: '36px',
+                                    padding: 0,
+                                    background: '#f0f9ff',
+                                    border: '1px solid #bae6fd',
+                                    borderRadius: '8px',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                    cursor: 'pointer',
+                                    transition: 'all 0.2s',
+                                    color: '#0369a1'
+                                  }}
+                                  onMouseEnter={(e) => {
+                                    e.target.style.background = '#e0f2fe'
+                                    e.target.style.borderColor = '#7dd3fc'
+                                    e.target.style.transform = 'translateY(-2px)'
+                                    e.target.style.boxShadow = '0 4px 8px rgba(3, 105, 161, 0.2)'
+                                  }}
+                                  onMouseLeave={(e) => {
+                                    e.target.style.background = '#f0f9ff'
+                                    e.target.style.borderColor = '#bae6fd'
+                                    e.target.style.transform = 'translateY(0)'
+                                    e.target.style.boxShadow = 'none'
+                                  }}
+                                >
+                                  <IconEye size={18} />
+                                </button>
+                                <button 
+                                  type="button" 
+                                  onClick={() => handleEditClick(usuario)}
+                                  title="Editar usuario"
+                                  style={{
+                                    width: '36px',
+                                    height: '36px',
+                                    padding: 0,
+                                    background: '#fef3c7',
+                                    border: '1px solid #fde68a',
+                                    borderRadius: '8px',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                    cursor: 'pointer',
+                                    transition: 'all 0.2s',
+                                    color: '#d97706'
+                                  }}
+                                  onMouseEnter={(e) => {
+                                    e.target.style.background = '#fde68a'
+                                    e.target.style.borderColor = '#fcd34d'
+                                    e.target.style.transform = 'translateY(-2px)'
+                                    e.target.style.boxShadow = '0 4px 8px rgba(217, 119, 6, 0.2)'
+                                  }}
+                                  onMouseLeave={(e) => {
+                                    e.target.style.background = '#fef3c7'
+                                    e.target.style.borderColor = '#fde68a'
+                                    e.target.style.transform = 'translateY(0)'
+                                    e.target.style.boxShadow = 'none'
+                                  }}
+                                >
+                                  <IconEdit size={18} />
+                                </button>
+                                <button 
+                                  type="button" 
+                                  onClick={() => handleDeleteUser(usuario)}
+                                  title="Eliminar usuario"
+                                  style={{
+                                    width: '36px',
+                                    height: '36px',
+                                    padding: 0,
+                                    background: '#fee2e2',
+                                    border: '1px solid #fecaca',
+                                    borderRadius: '8px',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                    cursor: 'pointer',
+                                    transition: 'all 0.2s',
+                                    color: '#dc2626'
+                                  }}
+                                  onMouseEnter={(e) => {
+                                    e.target.style.background = '#fecaca'
+                                    e.target.style.borderColor = '#fca5a5'
+                                    e.target.style.transform = 'translateY(-2px)'
+                                    e.target.style.boxShadow = '0 4px 8px rgba(220, 38, 38, 0.2)'
+                                  }}
+                                  onMouseLeave={(e) => {
+                                    e.target.style.background = '#fee2e2'
+                                    e.target.style.borderColor = '#fecaca'
+                                    e.target.style.transform = 'translateY(0)'
+                                    e.target.style.boxShadow = 'none'
+                                  }}
+                                >
+                                  <IconTrash size={18} />
+                                </button>
+                              </div>
                             </td>
                           </tr>
                         )
@@ -5339,10 +6304,31 @@ const UsersPanel = () => {
                   {empleadosFiltrados.length > 0 && (
                     <>
                       {(supervisoresFiltrados.length > 0 || empleadosFiltrados.length > 0) && (
-                        <tr style={{ backgroundColor: '#f9fafb', borderTop: supervisoresFiltrados.length > 0 ? '2px solid #e5e7eb' : '2px solid #3b82f6' }}>
-                          <td colSpan="6" style={{ padding: '0.75rem 1rem', fontWeight: '600', color: '#374151', fontSize: '0.875rem' }}>
-                            <span style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                              <IconUser size={16} />
+                        <tr style={{
+                          background: 'linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%)',
+                          borderTop: supervisoresFiltrados.length > 0 ? '3px solid #cbd5e1' : '3px solid #3b82f6'
+                        }}>
+                          <td colSpan="6" style={{
+                            padding: '1rem 1.25rem',
+                            fontWeight: '700',
+                            color: '#475569',
+                            fontSize: '0.9375rem',
+                            textTransform: 'uppercase',
+                            letterSpacing: '0.5px'
+                          }}>
+                            <span style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                              <div style={{
+                                width: '32px',
+                                height: '32px',
+                                borderRadius: '8px',
+                                background: 'linear-gradient(135deg, #475569 0%, #64748b 100%)',
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                boxShadow: '0 2px 8px rgba(71, 85, 105, 0.2)'
+                              }}>
+                                <IconUser size={18} style={{ color: '#ffffff' }} />
+                              </div>
                               Empleados ({empleadosFiltrados.length})
                             </span>
                           </td>
@@ -5369,35 +6355,112 @@ const UsersPanel = () => {
                                 {usuario.Activo ? 'Activo' : 'Inactivo'}
                               </span>
                             </td>
-                            <td className="table-actions">
-                              <button 
-                                type="button" 
-                                className="btn btn-outline btn-small"
-                                onClick={() => {
-                                  setSelectedUser(usuario)
-                                  setNewPassword('')
-                                  setShowResetPasswordModal(true)
-                                }}
-                                title="Restablecer contraseña"
-                              >
-                                <IconEye size={16} />
-                              </button>
-                              <button 
-                                type="button" 
-                                className="btn btn-outline btn-small"
-                                onClick={() => handleEditClick(usuario)}
-                                title="Editar usuario"
-                              >
-                                <IconEdit size={16} />
-                              </button>
-                              <button 
-                                type="button" 
-                                className="btn btn-outline btn-small danger"
-                                onClick={() => handleDeleteUser(usuario)}
-                                title="Eliminar usuario"
-                              >
-                                <IconTrash size={16} />
-                              </button>
+                            <td className="table-actions" style={{ padding: '0.75rem' }}>
+                              <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'center' }}>
+                                <button 
+                                  type="button" 
+                                  onClick={() => {
+                                    setSelectedUser(usuario)
+                                    setNewPassword('')
+                                    setShowResetPasswordModal(true)
+                                  }}
+                                  title="Restablecer contraseña"
+                                  style={{
+                                    width: '36px',
+                                    height: '36px',
+                                    padding: 0,
+                                    background: '#f0f9ff',
+                                    border: '1px solid #bae6fd',
+                                    borderRadius: '8px',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                    cursor: 'pointer',
+                                    transition: 'all 0.2s',
+                                    color: '#0369a1'
+                                  }}
+                                  onMouseEnter={(e) => {
+                                    e.target.style.background = '#e0f2fe'
+                                    e.target.style.borderColor = '#7dd3fc'
+                                    e.target.style.transform = 'translateY(-2px)'
+                                    e.target.style.boxShadow = '0 4px 8px rgba(3, 105, 161, 0.2)'
+                                  }}
+                                  onMouseLeave={(e) => {
+                                    e.target.style.background = '#f0f9ff'
+                                    e.target.style.borderColor = '#bae6fd'
+                                    e.target.style.transform = 'translateY(0)'
+                                    e.target.style.boxShadow = 'none'
+                                  }}
+                                >
+                                  <IconEye size={18} />
+                                </button>
+                                <button 
+                                  type="button" 
+                                  onClick={() => handleEditClick(usuario)}
+                                  title="Editar usuario"
+                                  style={{
+                                    width: '36px',
+                                    height: '36px',
+                                    padding: 0,
+                                    background: '#fef3c7',
+                                    border: '1px solid #fde68a',
+                                    borderRadius: '8px',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                    cursor: 'pointer',
+                                    transition: 'all 0.2s',
+                                    color: '#d97706'
+                                  }}
+                                  onMouseEnter={(e) => {
+                                    e.target.style.background = '#fde68a'
+                                    e.target.style.borderColor = '#fcd34d'
+                                    e.target.style.transform = 'translateY(-2px)'
+                                    e.target.style.boxShadow = '0 4px 8px rgba(217, 119, 6, 0.2)'
+                                  }}
+                                  onMouseLeave={(e) => {
+                                    e.target.style.background = '#fef3c7'
+                                    e.target.style.borderColor = '#fde68a'
+                                    e.target.style.transform = 'translateY(0)'
+                                    e.target.style.boxShadow = 'none'
+                                  }}
+                                >
+                                  <IconEdit size={18} />
+                                </button>
+                                <button 
+                                  type="button" 
+                                  onClick={() => handleDeleteUser(usuario)}
+                                  title="Eliminar usuario"
+                                  style={{
+                                    width: '36px',
+                                    height: '36px',
+                                    padding: 0,
+                                    background: '#fee2e2',
+                                    border: '1px solid #fecaca',
+                                    borderRadius: '8px',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                    cursor: 'pointer',
+                                    transition: 'all 0.2s',
+                                    color: '#dc2626'
+                                  }}
+                                  onMouseEnter={(e) => {
+                                    e.target.style.background = '#fecaca'
+                                    e.target.style.borderColor = '#fca5a5'
+                                    e.target.style.transform = 'translateY(-2px)'
+                                    e.target.style.boxShadow = '0 4px 8px rgba(220, 38, 38, 0.2)'
+                                  }}
+                                  onMouseLeave={(e) => {
+                                    e.target.style.background = '#fee2e2'
+                                    e.target.style.borderColor = '#fecaca'
+                                    e.target.style.transform = 'translateY(0)'
+                                    e.target.style.boxShadow = 'none'
+                                  }}
+                                >
+                                  <IconTrash size={18} />
+                                </button>
+                              </div>
                             </td>
                           </tr>
                         )
@@ -5440,22 +6503,120 @@ const UsersPanel = () => {
             </div>
             
             <div className="modal-body">
-              <p style={{ marginBottom: '1rem', color: '#64748b' }}>
-                Usuario: <strong>{selectedUser.NombreCompleto}</strong> ({selectedUser.Email})
-              </p>
-              <label>
-                <span>Nueva Contraseña *</span>
+              <div style={{ 
+                marginBottom: '1.5rem', 
+                padding: '1rem', 
+                backgroundColor: '#f8fafc', 
+                borderRadius: '8px',
+                border: '1px solid #e2e8f0'
+              }}>
+                <p style={{ margin: 0, color: '#475569', fontSize: '0.875rem', fontWeight: 500 }}>
+                  Usuario: <strong style={{ color: '#1e293b' }}>{selectedUser.NombreCompleto}</strong>
+                </p>
+                <p style={{ margin: '0.25rem 0 0 0', color: '#64748b', fontSize: '0.8125rem' }}>
+                  {selectedUser.Email}
+                </p>
+              </div>
+              
+              <label style={{ display: 'block', marginBottom: '0.75rem' }}>
+                <span style={{ 
+                  display: 'block', 
+                  marginBottom: '0.5rem', 
+                  fontSize: '0.875rem', 
+                  fontWeight: 500, 
+                  color: '#334155' 
+                }}>
+                  Nueva Contraseña <span style={{ color: '#ef4444' }}>*</span>
+                </span>
                 <input
                   type="password"
                   value={newPassword}
                   onChange={(e) => setNewPassword(e.target.value)}
-                  placeholder="Mínimo 6 caracteres"
+                  placeholder="Ingresa la nueva contraseña"
                   minLength={6}
                   required
+                  style={{
+                    width: '100%',
+                    padding: '0.75rem',
+                    border: '1px solid #cbd5e1',
+                    borderRadius: '6px',
+                    fontSize: '0.9375rem',
+                    transition: 'all 0.2s',
+                    outline: 'none'
+                  }}
+                  onFocus={(e) => {
+                    e.target.style.borderColor = '#3b82f6'
+                    e.target.style.boxShadow = '0 0 0 3px rgba(59, 130, 246, 0.1)'
+                  }}
+                  onBlur={(e) => {
+                    e.target.style.borderColor = '#cbd5e1'
+                    e.target.style.boxShadow = 'none'
+                  }}
                 />
+                <div style={{
+                  marginTop: '0.5rem',
+                  padding: '0.75rem',
+                  backgroundColor: '#f1f5f9',
+                  borderRadius: '6px',
+                  border: '1px solid #e2e8f0'
+                }}>
+                  <p style={{
+                    margin: '0 0 0.5rem 0',
+                    fontSize: '0.75rem',
+                    fontWeight: 600,
+                    color: '#475569',
+                    textTransform: 'uppercase',
+                    letterSpacing: '0.5px'
+                  }}>
+                    Requisitos de contraseña:
+                  </p>
+                  <div style={{ display: 'flex', alignItems: 'center', marginBottom: '0.375rem' }}>
+                    <span style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      width: '16px',
+                      height: '16px',
+                      borderRadius: '50%',
+                      backgroundColor: newPassword.length >= 6 ? '#10b981' : '#e2e8f0',
+                      color: newPassword.length >= 6 ? '#ffffff' : '#94a3b8',
+                      fontSize: '10px',
+                      fontWeight: 'bold',
+                      marginRight: '0.5rem',
+                      flexShrink: 0
+                    }}>
+                      {newPassword.length >= 6 ? '✓' : '•'}
+                    </span>
+                    <span style={{
+                      fontSize: '0.8125rem',
+                      color: newPassword.length >= 6 ? '#059669' : '#64748b',
+                      fontWeight: newPassword.length >= 6 ? 500 : 400
+                    }}>
+                      Mínimo 6 caracteres
+                    </span>
+                  </div>
+                </div>
               </label>
-              {error && <div className="status error" style={{ marginTop: '0.5rem' }}>{error}</div>}
-              {message && <div className="status success" style={{ marginTop: '0.5rem' }}>{message}</div>}
+              {error && (
+                <div className="status error" style={{ 
+                  marginTop: '0.75rem',
+                  padding: '0.75rem',
+                  borderRadius: '6px',
+                  fontSize: '0.875rem'
+                }}>
+                  {error}
+                </div>
+              )}
+              {message && (
+                <div className="status success" style={{ 
+                  marginTop: '0.75rem',
+                  padding: '0.75rem',
+                  borderRadius: '6px',
+                  fontSize: '0.875rem'
+                }}>
+                  {message}
+                </div>
+              )}
             </div>
             
             <div className="modal-footer">
@@ -5479,6 +6640,203 @@ const UsersPanel = () => {
                 disabled={loading || !newPassword}
               >
                 {loading ? 'Restableciendo...' : 'Restablecer Contraseña'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal de confirmación para eliminar usuario */}
+      {showDeleteConfirmModal && userToDelete && (
+        <div className="modal-overlay" onClick={() => {
+          setShowDeleteConfirmModal(false)
+          setUserToDelete(null)
+        }}>
+          <div className="modal-container" style={{ 
+            width: '500px', 
+            maxWidth: '90vw',
+            borderRadius: '12px',
+            boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04)'
+          }} onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header" style={{ 
+              borderBottom: '1px solid #e2e8f0',
+              padding: '1.5rem',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between'
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                <div style={{
+                  width: '40px',
+                  height: '40px',
+                  borderRadius: '50%',
+                  backgroundColor: '#fef2f2',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  flexShrink: 0
+                }}>
+                  <span style={{ fontSize: '20px', color: '#ef4444' }}>⚠️</span>
+                </div>
+                <h3 style={{ 
+                  margin: 0, 
+                  fontSize: '1.25rem', 
+                  fontWeight: 600, 
+                  color: '#1e293b' 
+                }}>
+                  Confirmar Eliminación
+                </h3>
+              </div>
+              <button 
+                type="button" 
+                className="modal-close-btn"
+                onClick={() => {
+                  setShowDeleteConfirmModal(false)
+                  setUserToDelete(null)
+                }}
+                aria-label="Cerrar"
+                style={{
+                  background: 'transparent',
+                  border: 'none',
+                  fontSize: '1.5rem',
+                  color: '#94a3b8',
+                  cursor: 'pointer',
+                  padding: '0.25rem',
+                  lineHeight: 1,
+                  transition: 'color 0.2s'
+                }}
+                onMouseEnter={(e) => e.target.style.color = '#64748b'}
+                onMouseLeave={(e) => e.target.style.color = '#94a3b8'}
+              >
+                ✕
+              </button>
+            </div>
+            
+            <div className="modal-body" style={{ padding: '1.5rem' }}>
+              <div style={{
+                marginBottom: '1rem',
+                padding: '1rem',
+                backgroundColor: '#f8fafc',
+                borderRadius: '8px',
+                border: '1px solid #e2e8f0'
+              }}>
+                <p style={{ 
+                  margin: 0, 
+                  fontSize: '0.875rem', 
+                  color: '#64748b',
+                  marginBottom: '0.5rem'
+                }}>
+                  Usuario:
+                </p>
+                <p style={{ 
+                  margin: 0, 
+                  fontSize: '1rem', 
+                  fontWeight: 600, 
+                  color: '#1e293b' 
+                }}>
+                  {userToDelete.NombreCompleto}
+                </p>
+                <p style={{ 
+                  margin: '0.25rem 0 0 0', 
+                  fontSize: '0.875rem', 
+                  color: '#64748b' 
+                }}>
+                  {userToDelete.Email}
+                </p>
+              </div>
+
+              <div style={{
+                padding: '1rem',
+                backgroundColor: '#fef2f2',
+                borderRadius: '8px',
+                border: '1px solid #fecaca',
+                marginBottom: '1.5rem'
+              }}>
+                <p style={{ 
+                  margin: 0, 
+                  fontSize: '0.9375rem', 
+                  color: '#991b1b',
+                  lineHeight: 1.6
+                }}>
+                  {userToDelete.EmpleadoId 
+                    ? `¿Estás seguro de eliminar al usuario ${userToDelete.NombreCompleto} y su empleado asociado? Esta acción no se puede deshacer.`
+                    : `¿Estás seguro de eliminar al usuario ${userToDelete.NombreCompleto}? Esta acción no se puede deshacer.`
+                  }
+                </p>
+              </div>
+
+              <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.5rem',
+                padding: '0.75rem',
+                backgroundColor: '#fffbeb',
+                borderRadius: '6px',
+                border: '1px solid #fde68a'
+              }}>
+                <span style={{ fontSize: '1rem' }}>⚠️</span>
+                <p style={{ 
+                  margin: 0, 
+                  fontSize: '0.8125rem', 
+                  color: '#92400e',
+                  lineHeight: 1.5
+                }}>
+                  Esta acción es permanente y no se puede revertir.
+                </p>
+              </div>
+            </div>
+            
+            <div className="modal-footer" style={{ 
+              padding: '1.5rem',
+              borderTop: '1px solid #e2e8f0',
+              display: 'flex',
+              justifyContent: 'flex-end',
+              gap: '0.75rem'
+            }}>
+              <button 
+                type="button" 
+                className="btn btn-outline"
+                onClick={() => {
+                  setShowDeleteConfirmModal(false)
+                  setUserToDelete(null)
+                }}
+                style={{
+                  padding: '0.625rem 1.25rem',
+                  fontSize: '0.9375rem',
+                  fontWeight: 500
+                }}
+              >
+                Cancelar
+              </button>
+              <button 
+                type="button" 
+                className="btn"
+                onClick={confirmDeleteUser}
+                disabled={loading}
+                style={{
+                  padding: '0.625rem 1.25rem',
+                  fontSize: '0.9375rem',
+                  fontWeight: 500,
+                  backgroundColor: '#ef4444',
+                  color: '#ffffff',
+                  border: 'none',
+                  borderRadius: '6px',
+                  cursor: loading ? 'not-allowed' : 'pointer',
+                  opacity: loading ? 0.6 : 1,
+                  transition: 'all 0.2s'
+                }}
+                onMouseEnter={(e) => {
+                  if (!loading) {
+                    e.target.style.backgroundColor = '#dc2626'
+                  }
+                }}
+                onMouseLeave={(e) => {
+                  if (!loading) {
+                    e.target.style.backgroundColor = '#ef4444'
+                  }
+                }}
+              >
+                {loading ? 'Eliminando...' : 'Confirmar y Eliminar'}
               </button>
             </div>
           </div>
@@ -5755,7 +7113,7 @@ const UsersPanel = () => {
 
                     {editRolesSeleccionados.some(roleId => {
                       const rol = roles.find(r => r.Id === roleId)
-                      return rol?.Name === 'Supervisor de Personal' || rol?.NormalizedName === 'SUPERVISOR DE PERSONAL'
+                      return esRolSupervisor(rol)
                     }) ? (
                       <label>
                         <span>Proyecto Supervisado *</span>
@@ -5998,6 +7356,170 @@ const UsersPanel = () => {
         }}
         initialSchedule={editScheduleData}
       />
+
+      {/* Notificaciones Toast Premium */}
+      {error && (
+        <div style={{
+          position: 'fixed',
+          top: '20px',
+          right: '20px',
+          zIndex: 10000,
+          background: '#ffffff',
+          border: '2px solid #ef4444',
+          borderRadius: '16px',
+          padding: '1.25rem 1.5rem',
+          boxShadow: '0 20px 25px -5px rgba(239, 68, 68, 0.3), 0 10px 10px -5px rgba(239, 68, 68, 0.1)',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '1rem',
+          minWidth: '360px',
+          maxWidth: '500px',
+          animation: 'slideInRight 0.4s cubic-bezier(0.16, 1, 0.3, 1)'
+        }}>
+          <div style={{
+            width: '48px',
+            height: '48px',
+            borderRadius: '12px',
+            background: 'linear-gradient(135deg, #fee2e2 0%, #fecaca 100%)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            flexShrink: 0,
+            boxShadow: '0 4px 12px rgba(239, 68, 68, 0.2)'
+          }}>
+            <span style={{ fontSize: '1.75rem' }}>⚠️</span>
+          </div>
+          <div style={{ flex: 1 }}>
+            <p style={{
+              margin: 0,
+              fontSize: '1rem',
+              fontWeight: 700,
+              color: '#dc2626',
+              marginBottom: '0.25rem'
+            }}>
+              Error
+            </p>
+            <p style={{
+              margin: 0,
+              fontSize: '0.9375rem',
+              color: '#991b1b',
+              lineHeight: 1.5
+            }}>
+              {error}
+            </p>
+          </div>
+          <button
+            onClick={() => setError('')}
+            style={{
+              background: 'transparent',
+              border: 'none',
+              fontSize: '1.5rem',
+              color: '#94a3b8',
+              cursor: 'pointer',
+              padding: '0.25rem',
+              lineHeight: 1,
+              transition: 'all 0.2s',
+              borderRadius: '6px',
+              width: '32px',
+              height: '32px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center'
+            }}
+            onMouseEnter={(e) => {
+              e.target.style.background = '#f1f5f9'
+              e.target.style.color = '#64748b'
+            }}
+            onMouseLeave={(e) => {
+              e.target.style.background = 'transparent'
+              e.target.style.color = '#94a3b8'
+            }}
+          >
+            ✕
+          </button>
+        </div>
+      )}
+      {message && (
+        <div style={{
+          position: 'fixed',
+          top: '20px',
+          right: '20px',
+          zIndex: 10000,
+          background: '#ffffff',
+          border: '2px solid #10b981',
+          borderRadius: '16px',
+          padding: '1.25rem 1.5rem',
+          boxShadow: '0 20px 25px -5px rgba(16, 185, 129, 0.3), 0 10px 10px -5px rgba(16, 185, 129, 0.1)',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '1rem',
+          minWidth: '360px',
+          maxWidth: '500px',
+          animation: 'slideInRight 0.4s cubic-bezier(0.16, 1, 0.3, 1)'
+        }}>
+          <div style={{
+            width: '48px',
+            height: '48px',
+            borderRadius: '12px',
+            background: 'linear-gradient(135deg, #d1fae5 0%, #a7f3d0 100%)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            flexShrink: 0,
+            boxShadow: '0 4px 12px rgba(16, 185, 129, 0.2)'
+          }}>
+            <span style={{ fontSize: '1.75rem' }}>✅</span>
+          </div>
+          <div style={{ flex: 1 }}>
+            <p style={{
+              margin: 0,
+              fontSize: '1rem',
+              fontWeight: 700,
+              color: '#059669',
+              marginBottom: '0.25rem'
+            }}>
+              ¡Éxito!
+            </p>
+            <p style={{
+              margin: 0,
+              fontSize: '0.9375rem',
+              color: '#047857',
+              lineHeight: 1.5
+            }}>
+              {message}
+            </p>
+          </div>
+          <button
+            onClick={() => setMessage('')}
+            style={{
+              background: 'transparent',
+              border: 'none',
+              fontSize: '1.5rem',
+              color: '#94a3b8',
+              cursor: 'pointer',
+              padding: '0.25rem',
+              lineHeight: 1,
+              transition: 'all 0.2s',
+              borderRadius: '6px',
+              width: '32px',
+              height: '32px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center'
+            }}
+            onMouseEnter={(e) => {
+              e.target.style.background = '#f1f5f9'
+              e.target.style.color = '#64748b'
+            }}
+            onMouseLeave={(e) => {
+              e.target.style.background = 'transparent'
+              e.target.style.color = '#94a3b8'
+            }}
+          >
+            ✕
+          </button>
+        </div>
+      )}
     </div>
   )
 }
@@ -6071,49 +7593,18 @@ const PayrollPanel = () => {
           return permiso?.Tipo || null
         }
 
-        // Función para recalcular tardía basándose en el horario del empleado
+        // Función para recalcular tardía basándose en el horario del empleado (usando helper centralizada)
         const recalcularTardia = async (asistencia, empleado) => {
           // Si no hay hora de entrada, no hay tardía
           if (!asistencia.HoraEntrada) return 0
           
-          // SIEMPRE obtener el horario laboral directamente de la tabla Empleados
-          // para asegurarnos de tener la versión más actualizada
+          // Obtener horario laboral usando función helper centralizada
           let horarioLaboral = null
-          
           if (empleado?.Id) {
-            const { data: empleadoData, error: empleadoError } = await supabase
-              .from('Empleados')
-              .select('HorarioLaboral')
-              .eq('Id', empleado.Id)
-              .single()
-            
-            if (empleadoError) {
-              console.error(`Error al obtener horario laboral para empleado ${empleado.Id}:`, empleadoError)
-            } else if (empleadoData?.HorarioLaboral) {
-              // Parsear el horario si viene como string JSON
-              if (typeof empleadoData.HorarioLaboral === 'string') {
-                try {
-                  horarioLaboral = JSON.parse(empleadoData.HorarioLaboral)
-                } catch (e) {
-                  console.error('Error al parsear horario laboral:', e)
-                  // Intentar usar el horario del JOIN como fallback
-                  if (empleado?.HorarioLaboral) {
-                    try {
-                      horarioLaboral = typeof empleado.HorarioLaboral === 'string' 
-                        ? JSON.parse(empleado.HorarioLaboral) 
-                        : empleado.HorarioLaboral
-                    } catch (e2) {
-                      console.error('Error al parsear horario del JOIN:', e2)
-                    }
-                  }
-                }
-              } else {
-                horarioLaboral = empleadoData.HorarioLaboral
-              }
-            }
+            horarioLaboral = await obtenerHorarioLaboralEmpleado(empleado.Id)
           }
           
-          // Si aún no hay horario laboral, intentar usar el del JOIN como último recurso
+          // Si no hay horario, intentar usar el del JOIN como fallback
           if (!horarioLaboral && empleado?.HorarioLaboral) {
             try {
               horarioLaboral = typeof empleado.HorarioLaboral === 'string' 
@@ -6127,86 +7618,31 @@ const PayrollPanel = () => {
           // Si aún no hay horario laboral, no calcular tardía
           if (!horarioLaboral) {
             console.warn(`⚠️ No hay horario laboral configurado para ${empleado?.NombreCompleto || 'empleado'}, no se calcula tardía`)
-            return 0
+            return asistencia.MinutosTardia || 0
           }
 
-          // VERIFICAR SI ES DÍA LABORAL SEGÚN EL HORARIO
-          const esDiaLaboralFecha = esDiaLaboral(horarioLaboral, asistencia.Fecha)
-          if (!esDiaLaboralFecha) {
-            console.log(`ℹ️ ${asistencia.Fecha} no es día laboral según el horario, no se calcula tardía`)
-            return 0
-          }
+          // Calcular tardía usando función helper centralizada
+          const minutosTardia = calcularTardiaEmpleado(
+            horarioLaboral, 
+            asistencia.Fecha, 
+            asistencia.HoraEntrada
+          )
 
-          try {
-            // Obtener hora esperada según el horario del empleado
-            const horaEsperadaData = obtenerHoraEntradaEsperada(horarioLaboral, asistencia.Fecha)
+          // Actualizar en la base de datos si hay diferencia o si no estaba calculado
+          if ((minutosTardia !== asistencia.MinutosTardia || asistencia.MinutosTardia === null) && asistencia.Id) {
+            const { error } = await supabase
+              .from('Asistencias')
+              .update({ MinutosTardia: minutosTardia })
+              .eq('Id', asistencia.Id)
             
-            if (!horaEsperadaData) {
-              console.warn(`⚠️ No se pudo obtener hora esperada para ${empleado?.NombreCompleto} en ${asistencia.Fecha}`)
-              // Si no hay hora esperada para ese día, no hay tardía
-              return 0
+            if (error) {
+              console.error('Error al actualizar minutos de tardía:', error)
+            } else {
+              asistencia.MinutosTardia = minutosTardia
             }
-
-            // Convertir hora de entrada a GMT-6 usando toLocaleString (igual que en el registro)
-            const horaEntradaReal = new Date(asistencia.HoraEntrada)
-            const horaRealStr = horaEntradaReal.toLocaleString('en-US', { 
-              timeZone: 'Etc/GMT+6',
-              hour: '2-digit',
-              minute: '2-digit',
-              hour12: false
-            })
-            
-            const [horaReal, minutoReal] = horaRealStr.split(':').map(Number)
-            
-            // Calcular diferencia en minutos desde medianoche
-            const minutosReal = horaReal * 60 + minutoReal
-            const minutosEsperados = horaEsperadaData.hora * 60 + horaEsperadaData.minuto
-            
-            // Calcular tardía básica (solo si llegó después de la hora esperada)
-            const diferencia = minutosReal - minutosEsperados
-            const minutosTardiaBasica = diferencia > 0 ? diferencia : 0
-            
-            // Aplicar reglas especiales de cálculo de tardía
-            const tardiaCalculada = calcularTardiaConReglas(minutosTardiaBasica)
-            const minutosTardia = minutosTardiaBasica // Guardamos los minutos reales para la BD
-
-            console.log(`📊 Cálculo de tardía para ${empleado?.NombreCompleto}:`, {
-              fecha: asistencia.Fecha,
-              horaEntradaUTC: asistencia.HoraEntrada,
-              horaEsperada: `${horaEsperadaData.hora}:${String(horaEsperadaData.minuto).padStart(2, '0')}`,
-              horaReal: `${horaReal}:${String(minutoReal).padStart(2, '0')}`,
-              minutosEsperados,
-              minutosReal,
-              diferencia,
-              minutosTardiaBasica,
-              tardiaCalculada: tardiaCalculada.descripcion,
-              anterior: asistencia.MinutosTardia,
-              horarioLaboral: horarioLaboral
-            })
-
-            // Siempre actualizar en la base de datos si hay diferencia o si no estaba calculado
-            if ((minutosTardia !== asistencia.MinutosTardia || asistencia.MinutosTardia === null) && asistencia.Id) {
-              // Actualizar de forma asíncrona sin bloquear la UI
-              const { error } = await supabase
-                .from('Asistencias')
-                .update({ MinutosTardia: minutosTardia })
-                .eq('Id', asistencia.Id)
-              
-              if (error) {
-                console.error('Error al actualizar minutos de tardía:', error)
-              } else {
-                console.log(`✅ Tardía actualizada: ${tardiaCalculada.descripcion} (${minutosTardia} minutos reales, antes: ${asistencia.MinutosTardia})`)
-                // Actualizar el valor en el objeto asistencia para reflejarlo inmediatamente
-                asistencia.MinutosTardia = minutosTardia
-              }
-            }
-
-            return minutosTardia
-          } catch (err) {
-            console.error('Error al recalcular tardía:', err)
-            // En caso de error, usar el valor guardado
-            return asistencia.MinutosTardia !== null && asistencia.MinutosTardia !== undefined ? asistencia.MinutosTardia : 0
           }
+
+          return minutosTardia
         }
 
         // Recalcular tardías para todas las asistencias de forma asíncrona
@@ -6218,37 +7654,60 @@ const PayrollPanel = () => {
           const esVacaciones = tienePermiso && tipoPermiso === 'Vacaciones'
           const esPermiso = tienePermiso && tipoPermiso !== 'Vacaciones'
           
-          // Obtener empleado y verificar si es día laboral según su horario
+          // Obtener empleado y determinar estado usando función helper centralizada
           const empleado = asistencia.Empleados
-          let esDiaLaboralSegunHorario = false
-          let minutosTardia = 0
           
-          // Verificar si es día laboral según el horario del empleado
-          if (empleado?.HorarioLaboral) {
-            esDiaLaboralSegunHorario = esDiaLaboral(empleado.HorarioLaboral, asistencia.Fecha)
-            
-            // Solo calcular tardía si es día laboral
-            if (esDiaLaboralSegunHorario) {
-              minutosTardia = await recalcularTardia(asistencia, empleado)
-            } else {
-              // Si no es día laboral, no hay tardía
-              minutosTardia = 0
+          // Obtener horario laboral usando función helper centralizada
+          let horarioLaboral = null
+          if (empleado?.Id) {
+            horarioLaboral = await obtenerHorarioLaboralEmpleado(empleado.Id)
+          }
+          
+          // Si no se obtuvo del helper, intentar parsear el del JOIN
+          if (!horarioLaboral && empleado?.HorarioLaboral) {
+            try {
+              horarioLaboral = typeof empleado.HorarioLaboral === 'string' 
+                ? JSON.parse(empleado.HorarioLaboral) 
+                : empleado.HorarioLaboral
+            } catch (e) {
+              console.error('Error al parsear horario laboral:', e)
             }
-          } else {
-            // Si no tiene horario, no se puede determinar si es día laboral
-            // No calcular tardía
-            minutosTardia = 0
+          }
+          
+          // Determinar estado de asistencia usando función helper centralizada
+          const estadoAsistencia = determinarEstadoAsistencia(
+            horarioLaboral,
+            asistencia.Fecha,
+            asistencia,
+            tienePermiso
+          )
+          
+          // Calcular tardía si es día laboral y tiene hora de entrada
+          let minutosTardia = 0
+          if (estadoAsistencia.esDiaLaboral && asistencia.HoraEntrada) {
+            minutosTardia = await recalcularTardia(asistencia, empleado)
           }
           
           // Formatear hora de llegada en zona horaria de Costa Rica
           const horaLlegada = formatHoraCR(asistencia.HoraEntrada) || '-'
           
-          // Solo contar como presente/ausente si es día laboral según el horario
-          // Si no es día laboral, no cuenta como presente ni ausente
-          const esPresente = esDiaLaboralSegunHorario && asistencia.Estado === 'Presente' && !tienePermiso
-          const esAusente = esDiaLaboralSegunHorario && asistencia.Estado === 'Ausente' && !tienePermiso
+          // Usar los estados determinados por la función helper
+          const esPresente = estadoAsistencia.esPresente
+          const esAusente = estadoAsistencia.esAusente
+          
+          // Log de verificación (temporal)
+          console.log('📋 Datos de planilla:', {
+            empleado: empleado?.NombreCompleto,
+            fechaOriginal: asistencia.Fecha,
+            fechaFormateada: formatFechaCR(asistencia.Fecha),
+            horaOriginal: asistencia.HoraEntrada,
+            horaFormateada: horaLlegada,
+            esPresente,
+            minutosTardia
+          })
           
           return {
+            id: asistencia.Id, // ID único para cada registro
             employee: empleado?.NombreCompleto || 'N/A',
             date: formatFechaCR(asistencia.Fecha),
             present: esPresente,
@@ -6369,7 +7828,7 @@ const PayrollPanel = () => {
             </thead>
             <tbody>
               {payrollRows.map((row) => (
-                <tr key={row.employee}>
+                <tr key={row.id}>
                   <td>{row.employee}</td>
                   <td>{row.date}</td>
                   <td>
@@ -6478,9 +7937,7 @@ const PermitsPanel = ({ currentUser, sessionInfo }) => {
           }
 
           const roles = rolesUsuario?.map(ur => ur.Roles).filter(Boolean) || []
-          const tieneSupervisor = roles.some(
-            r => r?.Name === 'Supervisor de Personal' || r?.NormalizedName === 'SUPERVISOR DE PERSONAL'
-          )
+          const tieneSupervisor = roles.some(esRolSupervisor)
           setIsSupervisor(tieneSupervisor)
         }
       } catch (err) {
@@ -7838,9 +9295,7 @@ const JustificationsPanel = ({ sessionInfo }) => {
           }
 
           const roles = rolesUsuario?.map(ur => ur.Roles).filter(Boolean) || []
-          const tieneSupervisor = roles.some(
-            r => r?.Name === 'Supervisor de Personal' || r?.NormalizedName === 'SUPERVISOR DE PERSONAL'
-          )
+          const tieneSupervisor = roles.some(esRolSupervisor)
           setIsSupervisor(tieneSupervisor)
         }
       } catch (err) {

@@ -418,3 +418,4 @@ return {
 4. **Validación de Justificaciones**: No se valida automáticamente si una justificación cubre una ausencia
 
 
+
